@@ -391,6 +391,18 @@ async def export_slash(interaction: discord.Interaction, amount: int):
     desc = f"📤 Dispensed **{len(items)}** account(s)\n📁 **{len(tokens)}** remaining"
     await interaction.followup.send(desc, file=file, ephemeral=True)
 
+    # Log to channel
+    try:
+        log_channel = bot.get_channel(LOG_CHANNEL_ID)
+        if log_channel:
+            log_embed = discord.Embed(title="📦 Export Log", color=0xFF9900, timestamp=datetime.utcnow())
+            log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
+            log_embed.add_field(name="Dispensed", value=f"**{len(items)}**", inline=True)
+            log_embed.add_field(name="Remaining", value=f"**{len(tokens)}**", inline=True)
+            await log_channel.send(embed=log_embed)
+    except Exception:
+        pass
+
 
 # ── /list command (show saved emails) ──────────────────────────────────────────
 
