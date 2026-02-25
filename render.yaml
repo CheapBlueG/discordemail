@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: uber-code-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: AZURE_TENANT
+        sync: false
+      - key: AZURE_CLIENT_ID
+        sync: false
+      - key: DATA_DIR
+        value: /var/data
