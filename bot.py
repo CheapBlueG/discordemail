@@ -352,10 +352,16 @@ async def export_slash(interaction: discord.Interaction, amount: int):
         pw = data.get("password", "")
         lines.append(f"{email}:{pw}:{data['refresh_token']}:{data['client_id']}")
 
+    # Remove exported accounts from saved tokens
+    for email, _ in items:
+        del tokens[email]
+    with open(TOKENS_FILE, "w") as f:
+        json.dump(tokens, f, indent=4)
+
     content = "\n".join(lines)
     file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_backup.txt")
 
-    desc = f"📁 Exported **{len(items)}** of **{total}** accounts"
+    desc = f"📤 Dispensed **{len(items)}** account(s)\n📁 **{len(tokens)}** remaining"
     await interaction.followup.send(desc, file=file, ephemeral=True)
 
 
