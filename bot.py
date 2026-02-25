@@ -5,6 +5,7 @@ import requests
 import re
 import os
 import json
+import io
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -15,7 +16,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-TOKENS_FILE = "saved_tokens.json"
+# ── Persistent Storage (Render Disk or local) ─────────────────────────────────
+# Set DATA_DIR env var to your Render disk mount path, e.g. /var/data
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+TOKENS_FILE = os.path.join(DATA_DIR, "saved_tokens.json")
 
 def load_saved_tokens():
     if os.path.exists(TOKENS_FILE):
@@ -29,7 +34,16 @@ def save_token(email, refresh_token, client_id):
     with open(TOKENS_FILE, "w") as f:
         json.dump(tokens, f, indent=4)
 
+def save_tokens_bulk(new_tokens: dict):
+    """Merge new tokens into existing file."""
+    tokens = load_saved_tokens()
+    tokens.update(new_tokens)
+    with open(TOKENS_FILE, "w") as f:
+        json.dump(tokens, f, indent=4)
+    return len(new_tokens)
+
 DEFAULT_TENANT = os.getenv("AZURE_TENANT", "consumers")
+DEFAULT_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
 
 TOKEN_URL = f"https://login.microsoftonline.com/{DEFAULT_TENANT}/oauth2/v2.0/token"
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
@@ -50,7 +64,6 @@ def extract_code(text: str) -> str | None:
         if match:
             return match.group(1)
 
-    # Fallback: any standalone 4-8 digit number (catches 9065 in the new email)
     match = re.search(r'(?<!\d)(\d{4,8})(?!\d)', text)
     if match:
         return match.group(1)
@@ -63,7 +76,7 @@ def strip_html(html: str) -> str:
 
 # ── Token Acquisition ──────────────────────────────────────────────────────────
 def get_token(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None):
-    client_id = client_id or os.getenv("AZURE_CLIENT_ID", "")
+    client_id = client_id or DEFAULT_CLIENT_ID
     if not client_id:
         return None, "**Client ID missing!**"
 
@@ -101,7 +114,7 @@ def get_token(refresh_token: str = None, client_id: str = None, email: str = Non
         return None, f"**Auth error:** {err[:300]}"
 
 
-# ── Fetch Uber Code (newest + priority for new header) ─────────────────────────
+# ── Fetch Uber Code ───────────────────────────────────────────────────────────
 def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None):
     token, error = get_token(refresh_token, client_id, email, password)
     if error:
@@ -109,16 +122,13 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
 
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Get the real email address
     me_resp = requests.get(f"{GRAPH_URL}/me?$select=mail,userPrincipalName", headers=headers)
     me = me_resp.json()
     account_email = me.get("mail") or me.get("userPrincipalName") or email or "Unknown"
 
-    # Save for quick use
     if refresh_token and client_id and account_email != "Unknown":
         save_token(account_email, refresh_token, client_id)
 
-    # Fetch emails
     params = {
         "$top": 200,
         "$select": "subject,body,from,receivedDateTime",
@@ -137,7 +147,6 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
     if not messages:
         return {"success": False, "error": "No emails found in inbox", "email": account_email}
 
-    # Sort by date descending (newest first)
     def parse_date(d):
         try:
             return datetime.fromisoformat(d.replace("Z", "+00:00"))
@@ -146,7 +155,6 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
 
     messages.sort(key=lambda x: parse_date(x.get("receivedDateTime", "")), reverse=True)
 
-    # Priority for new header
     for msg in messages:
         subject = msg.get("subject", "").lower()
         if "your uber verification code" in subject or "verification code" in subject:
@@ -163,7 +171,6 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
                     "email": account_email,
                 }
 
-    # Fallback to any Uber email
     for msg in messages:
         subject = msg.get("subject", "").lower()
         from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "").lower()
@@ -191,12 +198,10 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
     }
 
 
-# ── Discord Command (smart one-line with memory) ───────────────────────────────
+# ── /code command ──────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="code", description="Get Uber code — email or token:client_id")
-@app_commands.describe(
-    input="email@outlook.com   OR   refresh_token:client_id"
-)
+@app_commands.describe(input="email@outlook.com   OR   refresh_token:client_id")
 async def code_slash(interaction: discord.Interaction, input: str):
     await interaction.response.defer(ephemeral=True)
 
@@ -236,9 +241,171 @@ async def code_slash(interaction: discord.Interaction, input: str):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+# ── /upload command (bulk import from .txt file) ───────────────────────────────
+
+@bot.tree.command(name="upload", description="Upload a .txt file with tokens (one per line)")
+@app_commands.describe(file="TXT file: email|refresh_token|client_id  (client_id optional)")
+async def upload_slash(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+
+    # Validate file type
+    if not file.filename.endswith(".txt"):
+        await interaction.followup.send("❌ Please upload a `.txt` file.", ephemeral=True)
+        return
+
+    try:
+        content = (await file.read()).decode("utf-8")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Could not read file: {e}", ephemeral=True)
+        return
+
+    lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+    if not lines:
+        await interaction.followup.send("❌ File is empty or has no valid lines.", ephemeral=True)
+        return
+
+    new_tokens = {}
+    errors = []
+
+    for i, line in enumerate(lines, 1):
+        # Supported formats:
+        #   email|refresh_token|client_id
+        #   email|refresh_token              (uses default AZURE_CLIENT_ID)
+        parts = [p.strip() for p in line.split("|")]
+
+        if len(parts) == 3:
+            email, rt, cid = parts
+        elif len(parts) == 2:
+            email, rt = parts
+            cid = DEFAULT_CLIENT_ID
+        else:
+            errors.append(f"Line {i}: bad format")
+            continue
+
+        if not email or "@" not in email:
+            errors.append(f"Line {i}: invalid email `{email}`")
+            continue
+        if not rt:
+            errors.append(f"Line {i}: missing refresh_token")
+            continue
+        if not cid:
+            errors.append(f"Line {i}: no client_id (set AZURE_CLIENT_ID env or add 3rd field)")
+            continue
+
+        new_tokens[email.lower()] = {"refresh_token": rt, "client_id": cid}
+
+    added = 0
+    if new_tokens:
+        added = save_tokens_bulk(new_tokens)
+
+    # Build response
+    total_saved = len(load_saved_tokens())
+    desc = f"✅ **{added}** account(s) imported\n📁 **{total_saved}** total saved"
+    if errors:
+        desc += f"\n⚠️ **{len(errors)}** error(s):\n" + "\n".join(errors[:10])
+        if len(errors) > 10:
+            desc += f"\n...and {len(errors) - 10} more"
+
+    embed = discord.Embed(title="📤 Upload Results", description=desc, color=0x00FF00 if added else 0xFFAA00)
+    embed.set_footer(text="Only you can see this")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ── /export command (download current tokens as txt) ───────────────────────────
+
+@bot.tree.command(name="export", description="Export a number of saved tokens as a .txt file")
+@app_commands.describe(amount="Number of accounts to export")
+async def export_slash(interaction: discord.Interaction, amount: int):
+    await interaction.response.defer(ephemeral=True)
+
+    tokens = load_saved_tokens()
+    if not tokens:
+        await interaction.followup.send("❌ No saved tokens to export.", ephemeral=True)
+        return
+
+    if amount < 1:
+        await interaction.followup.send("❌ Amount must be at least 1.", ephemeral=True)
+        return
+
+    items = list(tokens.items())
+    total = len(items)
+    items = items[:amount]
+
+    lines = []
+    for email, data in items:
+        lines.append(f"{email}|{data['refresh_token']}|{data['client_id']}")
+
+    content = "\n".join(lines)
+    file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_backup.txt")
+
+    desc = f"📁 Exported **{len(items)}** of **{total}** accounts"
+    await interaction.followup.send(desc, file=file, ephemeral=True)
+
+
+# ── /list command (show saved emails) ──────────────────────────────────────────
+
+@bot.tree.command(name="list", description="List all saved email accounts")
+async def list_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    tokens = load_saved_tokens()
+    if not tokens:
+        await interaction.followup.send("❌ No saved tokens.", ephemeral=True)
+        return
+
+    emails = list(tokens.keys())
+    pages = [emails[i:i+20] for i in range(0, len(emails), 20)]
+
+    desc = f"📁 **{len(emails)}** saved account(s):\n\n"
+    desc += "\n".join(f"`{e}`" for e in pages[0])
+    if len(pages) > 1:
+        desc += f"\n\n...and {len(emails) - 20} more"
+
+    embed = discord.Embed(title="📋 Saved Accounts", description=desc, color=0x5865F2)
+    embed.set_footer(text="Only you can see this")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ── /remove command (admin only) ───────────────────────────────────────────────
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    """Check if user has Administrator permission or a role named 'Admin'."""
+    if interaction.user.guild_permissions.administrator:
+        return True
+    return any(role.name.lower() == "admin" for role in interaction.user.roles)
+
+@bot.tree.command(name="remove", description="[Admin] Remove a saved email account")
+@app_commands.describe(email="Email to remove")
+async def remove_slash(interaction: discord.Interaction, email: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if not is_admin(interaction):
+        await interaction.followup.send("❌ You need the **Admin** role or **Administrator** permission to use this.", ephemeral=True)
+        return
+
+    tokens = load_saved_tokens()
+    email = email.strip().lower()
+
+    if email not in tokens:
+        await interaction.followup.send(f"❌ `{email}` not found in saved tokens.", ephemeral=True)
+        return
+
+    del tokens[email]
+    with open(TOKENS_FILE, "w") as f:
+        json.dump(tokens, f, indent=4)
+
+    await interaction.followup.send(f"✅ Removed `{email}`. **{len(tokens)}** accounts remaining.", ephemeral=True)
+
+
+# ── Bot Ready ──────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
     print(f"✅ Bot online: {bot.user}")
+    print(f"📁 Data dir: {DATA_DIR}")
+    print(f"📁 Tokens file: {TOKENS_FILE}")
+    print(f"📁 Saved accounts: {len(load_saved_tokens())}")
     try:
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} commands")
