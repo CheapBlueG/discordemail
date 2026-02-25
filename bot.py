@@ -51,6 +51,7 @@ def save_tokens_bulk(new_tokens: dict):
 
 DEFAULT_TENANT = os.getenv("AZURE_TENANT", "consumers")
 DEFAULT_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
+LOG_CHANNEL_ID = 1399288304767074404
 
 TOKEN_URL = f"https://login.microsoftonline.com/{DEFAULT_TENANT}/oauth2/v2.0/token"
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
@@ -337,6 +338,20 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
     embed = discord.Embed(title="📤 Upload Results", description=desc, color=0x00FF00 if added else 0xFFAA00)
     embed.set_footer(text="Only you can see this")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # Log to channel
+    try:
+        log_channel = bot.get_channel(LOG_CHANNEL_ID)
+        if log_channel:
+            log_embed = discord.Embed(title="📤 Upload Log", color=0x5865F2, timestamp=datetime.utcnow())
+            log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
+            log_embed.add_field(name="Added", value=f"**{added}**", inline=True)
+            log_embed.add_field(name="Duplicates", value=f"**{len(skipped)}**", inline=True)
+            log_embed.add_field(name="Errors", value=f"**{len(errors)}**", inline=True)
+            log_embed.add_field(name="Total Saved", value=f"**{total_saved}**", inline=True)
+            await log_channel.send(embed=log_embed)
+    except Exception:
+        pass
 
 
 # ── /export command (download current tokens as txt) ───────────────────────────
