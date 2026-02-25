@@ -244,11 +244,10 @@ async def code_slash(interaction: discord.Interaction, input: str):
 # ── /upload command (bulk import from .txt file) ───────────────────────────────
 
 @bot.tree.command(name="upload", description="Upload a .txt file with tokens (one per line)")
-@app_commands.describe(file="TXT file: email|refresh_token|client_id  (client_id optional)")
+@app_commands.describe(file="TXT file: email:pass:refresh_token:client_id per line")
 async def upload_slash(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(ephemeral=True)
 
-    # Validate file type
     if not file.filename.endswith(".txt"):
         await interaction.followup.send("❌ Please upload a `.txt` file.", ephemeral=True)
         return
@@ -269,37 +268,53 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
     errors = []
 
     for i, line in enumerate(lines, 1):
-        # Supported formats:
-        #   email|refresh_token|client_id
-        #   email|refresh_token              (uses default AZURE_CLIENT_ID)
-        parts = [p.strip() for p in line.split("|")]
+        # Format: email:pass:refresh_token:client_id
+        # Refresh tokens can contain colons, so we parse smartly:
+        # - part 0 = email
+        # - part 1 = password
+        # - last UUID-shaped part = client_id
+        # - everything between part 1 and client_id = refresh_token
+        parts = line.split(":")
 
-        if len(parts) == 3:
-            email, rt, cid = parts
-        elif len(parts) == 2:
-            email, rt = parts
-            cid = DEFAULT_CLIENT_ID
-        else:
-            errors.append(f"Line {i}: bad format")
+        if len(parts) < 4:
+            errors.append(f"Line {i}: not enough fields (need email:pass:token:clientid)")
             continue
+
+        email = parts[0].strip()
+        password = parts[1].strip()
+
+        # Find client_id: last part matching UUID pattern, or just the last part
+        client_id = None
+        token_end = len(parts)
+        for j in range(len(parts) - 1, 1, -1):
+            if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', parts[j].strip(), re.IGNORECASE):
+                client_id = parts[j].strip()
+                token_end = j
+                break
+
+        if not client_id:
+            client_id = parts[-1].strip()
+            token_end = len(parts) - 1
+
+        refresh_token = ":".join(parts[2:token_end]).strip()
 
         if not email or "@" not in email:
             errors.append(f"Line {i}: invalid email `{email}`")
             continue
-        if not rt:
+        if not refresh_token:
             errors.append(f"Line {i}: missing refresh_token")
             continue
-        if not cid:
-            errors.append(f"Line {i}: no client_id (set AZURE_CLIENT_ID env or add 3rd field)")
-            continue
 
-        new_tokens[email.lower()] = {"refresh_token": rt, "client_id": cid}
+        new_tokens[email.lower()] = {
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "password": password,
+        }
 
     added = 0
     if new_tokens:
         added = save_tokens_bulk(new_tokens)
 
-    # Build response
     total_saved = len(load_saved_tokens())
     desc = f"✅ **{added}** account(s) imported\n📁 **{total_saved}** total saved"
     if errors:
@@ -334,7 +349,8 @@ async def export_slash(interaction: discord.Interaction, amount: int):
 
     lines = []
     for email, data in items:
-        lines.append(f"{email}|{data['refresh_token']}|{data['client_id']}")
+        pw = data.get("password", "")
+        lines.append(f"{email}:{pw}:{data['refresh_token']}:{data['client_id']}")
 
     content = "\n".join(lines)
     file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_backup.txt")
