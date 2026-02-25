@@ -35,12 +35,19 @@ def save_token(email, refresh_token, client_id):
         json.dump(tokens, f, indent=4)
 
 def save_tokens_bulk(new_tokens: dict):
-    """Merge new tokens into existing file."""
+    """Merge new tokens into existing file, skipping duplicates."""
     tokens = load_saved_tokens()
-    tokens.update(new_tokens)
+    added = 0
+    skipped = []
+    for email, data in new_tokens.items():
+        if email in tokens:
+            skipped.append(email)
+        else:
+            tokens[email] = data
+            added += 1
     with open(TOKENS_FILE, "w") as f:
         json.dump(tokens, f, indent=4)
-    return len(new_tokens)
+    return added, skipped
 
 DEFAULT_TENANT = os.getenv("AZURE_TENANT", "consumers")
 DEFAULT_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
@@ -312,13 +319,18 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
         }
 
     added = 0
+    skipped = []
     if new_tokens:
-        added = save_tokens_bulk(new_tokens)
+        added, skipped = save_tokens_bulk(new_tokens)
 
     total_saved = len(load_saved_tokens())
     desc = f"✅ **{added}** account(s) imported\n📁 **{total_saved}** total saved"
+    if skipped:
+        desc += f"\n⚠️ **{len(skipped)}** duplicate(s) skipped:\n" + "\n".join(f"`{e}`" for e in skipped[:10])
+        if len(skipped) > 10:
+            desc += f"\n...and {len(skipped) - 10} more"
     if errors:
-        desc += f"\n⚠️ **{len(errors)}** error(s):\n" + "\n".join(errors[:10])
+        desc += f"\n❌ **{len(errors)}** error(s):\n" + "\n".join(errors[:10])
         if len(errors) > 10:
             desc += f"\n...and {len(errors) - 10} more"
 
