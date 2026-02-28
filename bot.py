@@ -6,6 +6,7 @@ import re
 import os
 import json
 import io
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -17,37 +18,34 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ── Persistent Storage (Render Disk or local) ─────────────────────────────────
-# Set DATA_DIR env var to your Render disk mount path, e.g. /var/data
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 TOKENS_FILE = os.path.join(DATA_DIR, "saved_tokens.json")
+EXPORTED_FILE = os.path.join(DATA_DIR, "exported_emails.json")
 
-def load_saved_tokens():
-    if os.path.exists(TOKENS_FILE):
-        with open(TOKENS_FILE, "r") as f:
+# Lock to prevent concurrent file read/write corruption
+file_lock = asyncio.Lock()
+
+def _load_json(path):
+    if os.path.exists(path):
+        with open(path, "r") as f:
             return json.load(f)
     return {}
 
-def save_token(email, refresh_token, client_id):
-    tokens = load_saved_tokens()
-    tokens[email.lower()] = {"refresh_token": refresh_token, "client_id": client_id}
-    with open(TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=4)
+def _save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4)
 
-def save_tokens_bulk(new_tokens: dict):
-    """Merge new tokens into existing file, skipping duplicates."""
-    tokens = load_saved_tokens()
-    added = 0
-    skipped = []
-    for email, data in new_tokens.items():
-        if email in tokens:
-            skipped.append(email)
-        else:
-            tokens[email] = data
-            added += 1
-    with open(TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=4)
-    return added, skipped
+def load_saved_tokens():
+    return _load_json(TOKENS_FILE)
+
+def load_exported_emails():
+    """Returns a set of emails that have been exported/dispensed."""
+    data = _load_json(EXPORTED_FILE)
+    return set(data.get("emails", []))
+
+def save_exported_emails(emails_set):
+    _save_json(EXPORTED_FILE, {"emails": list(emails_set)})
 
 DEFAULT_TENANT = os.getenv("AZURE_TENANT", "consumers")
 DEFAULT_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
@@ -123,7 +121,7 @@ def get_token(refresh_token: str = None, client_id: str = None, email: str = Non
 
 
 # ── Fetch Uber Code ───────────────────────────────────────────────────────────
-def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None):
+def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None, auto_save: bool = True):
     token, error = get_token(refresh_token, client_id, email, password)
     if error:
         return {"success": False, "error": error}
@@ -134,8 +132,13 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
     me = me_resp.json()
     account_email = me.get("mail") or me.get("userPrincipalName") or email or "Unknown"
 
-    if refresh_token and client_id and account_email != "Unknown":
-        save_token(account_email, refresh_token, client_id)
+    # Only auto-save if requested and not previously exported
+    if auto_save and refresh_token and client_id and account_email != "Unknown":
+        exported = load_exported_emails()
+        if account_email.lower() not in exported:
+            tokens = load_saved_tokens()
+            tokens[account_email.lower()] = {"refresh_token": refresh_token, "client_id": client_id}
+            _save_json(TOKENS_FILE, tokens)
 
     params = {
         "$top": 200,
@@ -213,21 +216,21 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
 async def code_slash(interaction: discord.Interaction, input: str):
     await interaction.response.defer(ephemeral=True)
 
-    saved = load_saved_tokens()
-
     if "@" in input and ":" not in input:
         email = input.strip().lower()
+        async with file_lock:
+            saved = load_saved_tokens()
         if email in saved:
             rt = saved[email]["refresh_token"]
             cid = saved[email]["client_id"]
-            result = fetch_uber_code(refresh_token=rt, client_id=cid)
+            result = fetch_uber_code(refresh_token=rt, client_id=cid, auto_save=False)
         else:
             await interaction.followup.send(f"❌ No saved token for `{email}`.\nFirst use the full `refresh_token:client_id` once.", ephemeral=True)
             return
     elif ":" in input:
         try:
             refresh_token, client_id = [x.strip() for x in input.split(":", 1)]
-            result = fetch_uber_code(refresh_token=refresh_token, client_id=client_id)
+            result = fetch_uber_code(refresh_token=refresh_token, client_id=client_id, auto_save=True)
         except:
             await interaction.followup.send("❌ Wrong format.\nUse: `email@outlook.com` or `refresh_token:client_id`", ephemeral=True)
             return
@@ -276,12 +279,6 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
     errors = []
 
     for i, line in enumerate(lines, 1):
-        # Format: email:pass:refresh_token:client_id
-        # Refresh tokens can contain colons, so we parse smartly:
-        # - part 0 = email
-        # - part 1 = password
-        # - last UUID-shaped part = client_id
-        # - everything between part 1 and client_id = refresh_token
         parts = line.split(":")
 
         if len(parts) < 4:
@@ -291,7 +288,6 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
         email = parts[0].strip()
         password = parts[1].strip()
 
-        # Find client_id: last part matching UUID pattern, or just the last part
         client_id = None
         token_end = len(parts)
         for j in range(len(parts) - 1, 1, -1):
@@ -319,15 +315,26 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
             "password": password,
         }
 
-    added = 0
-    skipped = []
-    if new_tokens:
-        added, skipped = save_tokens_bulk(new_tokens)
+    # Lock file for atomic read-modify-write
+    async with file_lock:
+        tokens = load_saved_tokens()
+        exported = load_exported_emails()
+        added = 0
+        skipped = []
+        for email, data in new_tokens.items():
+            if email in tokens:
+                skipped.append(f"`{email}` (already saved)")
+            elif email in exported:
+                skipped.append(f"`{email}` (previously exported)")
+            else:
+                tokens[email] = data
+                added += 1
+        _save_json(TOKENS_FILE, tokens)
+        total_saved = len(tokens)
 
-    total_saved = len(load_saved_tokens())
     desc = f"✅ **{added}** account(s) imported\n📁 **{total_saved}** total saved"
     if skipped:
-        desc += f"\n⚠️ **{len(skipped)}** duplicate(s) skipped:\n" + "\n".join(f"`{e}`" for e in skipped[:10])
+        desc += f"\n⚠️ **{len(skipped)}** skipped:\n" + "\n".join(skipped[:10])
         if len(skipped) > 10:
             desc += f"\n...and {len(skipped) - 10} more"
     if errors:
@@ -346,7 +353,7 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
             log_embed = discord.Embed(title="📤 Upload Log", color=0x5865F2, timestamp=datetime.utcnow())
             log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
             log_embed.add_field(name="Added", value=f"**{added}**", inline=True)
-            log_embed.add_field(name="Duplicates", value=f"**{len(skipped)}**", inline=True)
+            log_embed.add_field(name="Skipped", value=f"**{len(skipped)}**", inline=True)
             log_embed.add_field(name="Errors", value=f"**{len(errors)}**", inline=True)
             log_embed.add_field(name="Total Saved", value=f"**{total_saved}**", inline=True)
             await log_channel.send(embed=log_embed)
@@ -354,41 +361,48 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
         pass
 
 
-# ── /export command (download current tokens as txt) ───────────────────────────
+# ── /export command (dispense and remove) ─────────────────────────────────────
 
 @bot.tree.command(name="export", description="Export a number of saved tokens as a .txt file")
 @app_commands.describe(amount="Number of accounts to export")
 async def export_slash(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(ephemeral=True)
 
-    tokens = load_saved_tokens()
-    if not tokens:
-        await interaction.followup.send("❌ No saved tokens to export.", ephemeral=True)
-        return
+    # Lock file for atomic read-modify-write
+    async with file_lock:
+        tokens = load_saved_tokens()
+        if not tokens:
+            await interaction.followup.send("❌ No saved tokens to export.", ephemeral=True)
+            return
 
-    if amount < 1:
-        await interaction.followup.send("❌ Amount must be at least 1.", ephemeral=True)
-        return
+        if amount < 1:
+            await interaction.followup.send("❌ Amount must be at least 1.", ephemeral=True)
+            return
 
-    items = list(tokens.items())
-    total = len(items)
-    items = items[:amount]
+        items = list(tokens.items())[:amount]
+
+        # Remove exported accounts from saved tokens
+        for email, _ in items:
+            del tokens[email]
+        _save_json(TOKENS_FILE, tokens)
+
+        # Track exported emails so they can never be re-added
+        exported = load_exported_emails()
+        for email, _ in items:
+            exported.add(email)
+        save_exported_emails(exported)
+
+        remaining = len(tokens)
 
     lines = []
     for email, data in items:
         pw = data.get("password", "")
         lines.append(f"{email}:{pw}:{data['refresh_token']}:{data['client_id']}")
 
-    # Remove exported accounts from saved tokens
-    for email, _ in items:
-        del tokens[email]
-    with open(TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=4)
-
     content = "\n".join(lines)
     file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_backup.txt")
 
-    desc = f"📤 Dispensed **{len(items)}** account(s)\n📁 **{len(tokens)}** remaining"
+    desc = f"📤 Dispensed **{len(items)}** account(s)\n📁 **{remaining}** remaining"
     await interaction.followup.send(desc, file=file, ephemeral=True)
 
     # Log to channel
@@ -398,7 +412,7 @@ async def export_slash(interaction: discord.Interaction, amount: int):
             log_embed = discord.Embed(title="📦 Export Log", color=0xFF9900, timestamp=datetime.utcnow())
             log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
             log_embed.add_field(name="Dispensed", value=f"**{len(items)}**", inline=True)
-            log_embed.add_field(name="Remaining", value=f"**{len(tokens)}**", inline=True)
+            log_embed.add_field(name="Remaining", value=f"**{remaining}**", inline=True)
             await log_channel.send(embed=log_embed)
     except Exception:
         pass
@@ -410,7 +424,9 @@ async def export_slash(interaction: discord.Interaction, amount: int):
 async def list_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
-    tokens = load_saved_tokens()
+    async with file_lock:
+        tokens = load_saved_tokens()
+
     if not tokens:
         await interaction.followup.send("❌ No saved tokens.", ephemeral=True)
         return
@@ -431,7 +447,6 @@ async def list_slash(interaction: discord.Interaction):
 # ── /remove command (admin only) ───────────────────────────────────────────────
 
 def is_admin(interaction: discord.Interaction) -> bool:
-    """Check if user has Administrator permission or a role named 'Admin'."""
     if interaction.user.guild_permissions.administrator:
         return True
     return any(role.name.lower() == "admin" for role in interaction.user.roles)
@@ -445,16 +460,16 @@ async def remove_slash(interaction: discord.Interaction, email: str):
         await interaction.followup.send("❌ You need the **Admin** role or **Administrator** permission to use this.", ephemeral=True)
         return
 
-    tokens = load_saved_tokens()
-    email = email.strip().lower()
+    async with file_lock:
+        tokens = load_saved_tokens()
+        email = email.strip().lower()
 
-    if email not in tokens:
-        await interaction.followup.send(f"❌ `{email}` not found in saved tokens.", ephemeral=True)
-        return
+        if email not in tokens:
+            await interaction.followup.send(f"❌ `{email}` not found in saved tokens.", ephemeral=True)
+            return
 
-    del tokens[email]
-    with open(TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=4)
+        del tokens[email]
+        _save_json(TOKENS_FILE, tokens)
 
     await interaction.followup.send(f"✅ Removed `{email}`. **{len(tokens)}** accounts remaining.", ephemeral=True)
 
@@ -467,6 +482,7 @@ async def on_ready():
     print(f"📁 Data dir: {DATA_DIR}")
     print(f"📁 Tokens file: {TOKENS_FILE}")
     print(f"📁 Saved accounts: {len(load_saved_tokens())}")
+    print(f"📁 Exported emails: {len(load_exported_emails())}")
     try:
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} commands")
