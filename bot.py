@@ -84,7 +84,7 @@ def strip_html(html: str) -> str:
 def get_token(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None):
     client_id = client_id or DEFAULT_CLIENT_ID
     if not client_id:
-        return None, "**Client ID missing!**"
+        return None, "**Client ID missing!**", None
 
     if refresh_token:
         data = {
@@ -106,25 +106,29 @@ def get_token(refresh_token: str = None, client_id: str = None, email: str = Non
         resp = requests.post(TOKEN_URL, data=data, timeout=15)
         result = resp.json()
     except Exception as e:
-        return None, f"Network error: {e}"
+        return None, f"Network error: {e}", None
 
     if "access_token" in result:
-        return result["access_token"], None
+        new_refresh = result.get("refresh_token", None)
+        return result["access_token"], None, new_refresh
 
     err = result.get("error_description", str(result))
     if any(x in err for x in ["50126", "invalid_grant"]):
-        return None, "**Invalid credentials or expired refresh_token**"
+        return None, "**Invalid credentials or expired refresh_token**", None
     elif "7000218" in err:
-        return None, "**Public client flows not enabled in Azure**"
+        return None, "**Public client flows not enabled in Azure**", None
     else:
-        return None, f"**Auth error:** {err[:300]}"
+        return None, f"**Auth error:** {err[:300]}", None
 
 
 # ── Fetch Uber Code ───────────────────────────────────────────────────────────
-def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None, auto_save: bool = True):
-    token, error = get_token(refresh_token, client_id, email, password)
+def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None):
+    token, error, new_refresh = get_token(refresh_token, client_id, email, password)
     if error:
         return {"success": False, "error": error}
+
+    # Use the new refresh token if Microsoft provided one, otherwise keep original
+    latest_refresh = new_refresh or refresh_token
 
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -132,13 +136,16 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
     me = me_resp.json()
     account_email = me.get("mail") or me.get("userPrincipalName") or email or "Unknown"
 
-    # Only auto-save if requested and not previously exported
-    if auto_save and refresh_token and client_id and account_email != "Unknown":
-        exported = load_exported_emails()
-        if account_email.lower() not in exported:
-            tokens = load_saved_tokens()
-            tokens[account_email.lower()] = {"refresh_token": refresh_token, "client_id": client_id}
-            _save_json(TOKENS_FILE, tokens)
+    # Always update the saved token
+    if latest_refresh and client_id and account_email != "Unknown":
+        tokens = load_saved_tokens()
+        existing = tokens.get(account_email.lower(), {})
+        tokens[account_email.lower()] = {
+            "refresh_token": latest_refresh,
+            "client_id": client_id,
+            "password": existing.get("password", ""),
+        }
+        _save_json(TOKENS_FILE, tokens)
 
     params = {
         "$top": 200,
@@ -223,14 +230,14 @@ async def code_slash(interaction: discord.Interaction, input: str):
         if email in saved:
             rt = saved[email]["refresh_token"]
             cid = saved[email]["client_id"]
-            result = fetch_uber_code(refresh_token=rt, client_id=cid, auto_save=False)
+            result = fetch_uber_code(refresh_token=rt, client_id=cid)
         else:
             await interaction.followup.send(f"❌ No saved token for `{email}`.\nFirst use the full `refresh_token:client_id` once.", ephemeral=True)
             return
     elif ":" in input:
         try:
             refresh_token, client_id = [x.strip() for x in input.split(":", 1)]
-            result = fetch_uber_code(refresh_token=refresh_token, client_id=client_id, auto_save=True)
+            result = fetch_uber_code(refresh_token=refresh_token, client_id=client_id)
         except:
             await interaction.followup.send("❌ Wrong format.\nUse: `email@outlook.com` or `refresh_token:client_id`", ephemeral=True)
             return
