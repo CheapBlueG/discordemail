@@ -17,35 +17,14 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ── Persistent Storage (Render Disk or local) ─────────────────────────────────
+# ── Persistent Storage (Render Disk) ──────────────────────────────────────────
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 TOKENS_FILE = os.path.join(DATA_DIR, "saved_tokens.json")
-EXPORTED_FILE = os.path.join(DATA_DIR, "exported_emails.json")
+USED_CODES_FILE = os.path.join(DATA_DIR, "used_codes.json")
 
-# Lock to prevent concurrent file read/write corruption
+# Single lock for ALL file operations — no concurrent writes possible
 file_lock = asyncio.Lock()
-
-def _load_json(path):
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return {}
-
-def _save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=4)
-
-def load_saved_tokens():
-    return _load_json(TOKENS_FILE)
-
-def load_exported_emails():
-    """Returns a set of emails that have been exported/dispensed."""
-    data = _load_json(EXPORTED_FILE)
-    return set(data.get("emails", []))
-
-def save_exported_emails(emails_set):
-    _save_json(EXPORTED_FILE, {"emails": list(emails_set)})
 
 DEFAULT_TENANT = os.getenv("AZURE_TENANT", "consumers")
 DEFAULT_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
@@ -54,7 +33,33 @@ LOG_CHANNEL_ID = 1399288304767074404
 TOKEN_URL = f"https://login.microsoftonline.com/{DEFAULT_TENANT}/oauth2/v2.0/token"
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
-# ── Code Extraction (with standalone digit fallback) ───────────────────────────
+
+# ── File helpers (ONLY call these inside file_lock) ───────────────────────────
+
+def _read_tokens() -> dict:
+    if os.path.exists(TOKENS_FILE):
+        with open(TOKENS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def _write_tokens(tokens: dict):
+    with open(TOKENS_FILE, "w") as f:
+        json.dump(tokens, f, indent=4)
+
+def _read_used_codes() -> dict:
+    """Returns {email: [code1, code2, ...]}"""
+    if os.path.exists(USED_CODES_FILE):
+        with open(USED_CODES_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def _write_used_codes(data: dict):
+    with open(USED_CODES_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+
+# ── Code Extraction ───────────────────────────────────────────────────────────
+
 CODE_PATTERNS = [
     r'(\d{6})',
     r'code\s*[:\-\s]+(\d{4,8})',
@@ -69,79 +74,62 @@ def extract_code(text: str) -> str | None:
         match = re.search(pattern, text_lower)
         if match:
             return match.group(1)
-
     match = re.search(r'(?<!\d)(\d{4,8})(?!\d)', text)
     if match:
         return match.group(1)
-
     return None
 
 def strip_html(html: str) -> str:
     text = re.sub(r'<style[^>]*>.*?</style>|<script[^>]*>.*?</script>|<[^>]+>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
     return re.sub(r'\s+', ' ', text).strip()
 
+
 # ── Token Acquisition ──────────────────────────────────────────────────────────
-def get_token(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None):
-    client_id = client_id or DEFAULT_CLIENT_ID
-    if not client_id:
-        return None, "**Client ID missing!**", None
 
-    if refresh_token:
-        data = {
-            "client_id": client_id,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-            "scope": "https://graph.microsoft.com/.default",
-        }
-    else:
-        data = {
-            "client_id": client_id,
-            "scope": "https://graph.microsoft.com/.default",
-            "username": email,
-            "password": password,
-            "grant_type": "password",
-        }
-
+def get_token(refresh_token: str, client_id: str):
+    data = {
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+        "scope": "https://graph.microsoft.com/.default",
+    }
     try:
         resp = requests.post(TOKEN_URL, data=data, timeout=15)
         result = resp.json()
     except Exception as e:
-        return None, f"Network error: {e}", None
+        return None, f"Network error: {e}"
 
     if "access_token" in result:
-        new_refresh = result.get("refresh_token", None)
-        return result["access_token"], None, new_refresh
+        return result["access_token"], None
 
     err = result.get("error_description", str(result))
     if any(x in err for x in ["50126", "invalid_grant"]):
-        return None, "**Invalid credentials or expired refresh_token**", None
+        return None, "**Invalid credentials or expired refresh_token**"
     elif "7000218" in err:
-        return None, "**Public client flows not enabled in Azure**", None
+        return None, "**Public client flows not enabled in Azure**"
     else:
-        return None, f"**Auth error:** {err[:300]}", None
+        return None, f"**Auth error:** {err[:300]}"
 
 
-# ── Fetch Uber Code ───────────────────────────────────────────────────────────
-def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str = None, password: str = None):
-    token, error, new_refresh = get_token(refresh_token, client_id, email, password)
+# ── Fetch Uber Code (pure function — does NOT touch any files) ────────────────
+
+def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None):
+    """Fetches Uber code from inbox. Returns result dict. Never writes files."""
+    used_codes = used_codes or set()
+
+    token, error = get_token(refresh_token, client_id)
     if error:
         return {"success": False, "error": error}
 
-    # Use the new refresh token if Microsoft provided one, otherwise keep original
-    latest_refresh = new_refresh or refresh_token
-
     headers = {"Authorization": f"Bearer {token}"}
 
-    me_resp = requests.get(f"{GRAPH_URL}/me?$select=mail,userPrincipalName", headers=headers)
-    me = me_resp.json()
-    account_email = me.get("mail") or me.get("userPrincipalName") or email or "Unknown"
+    try:
+        me_resp = requests.get(f"{GRAPH_URL}/me?$select=mail,userPrincipalName", headers=headers, timeout=15)
+        me = me_resp.json()
+    except Exception as e:
+        return {"success": False, "error": f"Network error: {e}"}
 
-    # Pass these back so the caller can save under the lock
-    save_info = {
-        "_email": account_email.lower(),
-        "_refresh_token": latest_refresh,
-        "_client_id": client_id,
-    }
+    account_email = me.get("mail") or me.get("userPrincipalName") or "Unknown"
 
     params = {
         "$top": 200,
@@ -149,17 +137,20 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
     }
 
     try:
-        resp = requests.get(f"{GRAPH_URL}/me/messages", headers={**headers, "ConsistencyLevel": "eventual"}, params=params, timeout=15)
+        resp = requests.get(
+            f"{GRAPH_URL}/me/messages",
+            headers={**headers, "ConsistencyLevel": "eventual"},
+            params=params, timeout=15,
+        )
     except Exception as e:
-        return {"success": False, "error": f"Network error: {e}", **save_info}
+        return {"success": False, "error": f"Network error: {e}", "email": account_email}
 
     if resp.status_code != 200:
-        return {"success": False, "error": f"Graph error {resp.status_code}: {resp.text[:200]}", **save_info}
+        return {"success": False, "error": f"Graph error {resp.status_code}: {resp.text[:200]}", "email": account_email}
 
     messages = resp.json().get("value", [])
-
     if not messages:
-        return {"success": False, "error": "No emails found in inbox", "email": account_email, **save_info}
+        return {"success": False, "error": "No emails found in inbox", "email": account_email}
 
     def parse_date(d):
         try:
@@ -169,13 +160,14 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
 
     messages.sort(key=lambda x: parse_date(x.get("receivedDateTime", "")), reverse=True)
 
+    # Priority: verification code subject lines
     for msg in messages:
         subject = msg.get("subject", "").lower()
         if "your uber verification code" in subject or "verification code" in subject:
             body = msg.get("body", {})
             body_text = strip_html(body.get("content", "")) if body.get("contentType") == "html" else body.get("content", "")
             code = extract_code(subject + " " + body_text)
-            if code:
+            if code and code not in used_codes:
                 return {
                     "success": True,
                     "code": code,
@@ -183,20 +175,18 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
                     "from": msg.get("from", {}).get("emailAddress", {}).get("address", ""),
                     "date": msg.get("receivedDateTime", "")[:19].replace("T", " "),
                     "email": account_email,
-                    **save_info,
                 }
 
+    # Fallback: any Uber email
     for msg in messages:
         subject = msg.get("subject", "").lower()
         from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "").lower()
         if "uber" not in subject and "uber" not in from_addr:
             continue
-
         body = msg.get("body", {})
         body_text = strip_html(body.get("content", "")) if body.get("contentType") == "html" else body.get("content", "")
         code = extract_code(subject + " " + body_text)
-
-        if code:
+        if code and code not in used_codes:
             return {
                 "success": True,
                 "code": code,
@@ -204,67 +194,65 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
                 "from": msg.get("from", {}).get("emailAddress", {}).get("address", ""),
                 "date": msg.get("receivedDateTime", "")[:19].replace("T", " "),
                 "email": account_email,
-                **save_info,
             }
 
     return {
         "success": False,
-        "error": f"Found Uber emails but no verification code detected",
+        "error": "No new Uber verification code found (all codes already used)",
         "email": account_email,
-        **save_info,
     }
 
 
-# ── /code command ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# COMMANDS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── /code ──────────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="code", description="Get Uber code — email or token:client_id")
 @app_commands.describe(input="email@outlook.com   OR   refresh_token:client_id")
 async def code_slash(interaction: discord.Interaction, input: str):
     await interaction.response.defer(ephemeral=True)
 
+    # 1) Figure out which refresh_token + client_id to use
     if "@" in input and ":" not in input:
         email = input.strip().lower()
         async with file_lock:
-            saved = load_saved_tokens()
-        if email in saved:
-            rt = saved[email]["refresh_token"]
-            cid = saved[email]["client_id"]
-            result = fetch_uber_code(refresh_token=rt, client_id=cid)
-        else:
-            await interaction.followup.send(f"❌ No saved token for `{email}`.\nFirst use the full `refresh_token:client_id` once.", ephemeral=True)
+            saved = _read_tokens()
+        if email not in saved:
+            await interaction.followup.send(
+                f"❌ No saved token for `{email}`.\nUse `/upload` to add accounts first.",
+                ephemeral=True,
+            )
             return
+        rt = saved[email]["refresh_token"]
+        cid = saved[email]["client_id"]
     elif ":" in input:
-        try:
-            refresh_token, client_id = [x.strip() for x in input.split(":", 1)]
-            result = fetch_uber_code(refresh_token=refresh_token, client_id=client_id)
-        except:
-            await interaction.followup.send("❌ Wrong format.\nUse: `email@outlook.com` or `refresh_token:client_id`", ephemeral=True)
-            return
+        parts = input.split(":", 1)
+        rt = parts[0].strip()
+        cid = parts[1].strip()
     else:
         await interaction.followup.send("❌ Wrong format.\nUse: `email@outlook.com` or `refresh_token:client_id`", ephemeral=True)
         return
 
-    # Save/update token under lock — only touches the ONE email key, doesn't overwrite others
-    save_email = result.get("_email")
-    save_rt = result.get("_refresh_token")
-    save_cid = result.get("_client_id")
-    if save_email and save_rt and save_cid and save_email != "unknown":
-        async with file_lock:
-            tokens = load_saved_tokens()
-            if save_email in tokens:
-                # Update existing — keep password, update refresh token
-                tokens[save_email]["refresh_token"] = save_rt
-                tokens[save_email]["client_id"] = save_cid
-            else:
-                # New entry from token:client_id usage
-                tokens[save_email] = {
-                    "refresh_token": save_rt,
-                    "client_id": save_cid,
-                    "password": "",
-                }
-            _save_json(TOKENS_FILE, tokens)
+    # 2) Load used codes for this token (so we skip already-returned codes)
+    async with file_lock:
+        all_used = _read_used_codes()
+    token_key = rt[:20]  # use first 20 chars of refresh token as key
+    used_set = set(all_used.get(token_key, []))
 
+    # 3) Fetch code (pure function, no file writes)
+    result = fetch_uber_code(refresh_token=rt, client_id=cid, used_codes=used_set)
+
+    # 4) If we got a code, mark it as used
     if result["success"]:
+        async with file_lock:
+            all_used = _read_used_codes()  # re-read fresh
+            if token_key not in all_used:
+                all_used[token_key] = []
+            all_used[token_key].append(result["code"])
+            _write_used_codes(all_used)
+
         embed = discord.Embed(title="✅ Uber Code Found", color=0x00FF00)
         embed.add_field(name="Code", value=f"**{result['code']}**", inline=False)
         embed.add_field(name="Email", value=f"`{result['email']}`", inline=True)
@@ -278,7 +266,7 @@ async def code_slash(interaction: discord.Interaction, input: str):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ── /upload command (bulk import from .txt file) ───────────────────────────────
+# ── /upload ────────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="upload", description="Upload a .txt file with tokens (one per line)")
 @app_commands.describe(file="TXT file: email:pass:refresh_token:client_id per line")
@@ -296,24 +284,23 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
         return
 
     lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
-
     if not lines:
         await interaction.followup.send("❌ File is empty or has no valid lines.", ephemeral=True)
         return
 
-    new_tokens = {}
+    # Parse all lines first (no file access needed)
+    parsed = {}
     errors = []
-
     for i, line in enumerate(lines, 1):
         parts = line.split(":")
-
         if len(parts) < 4:
-            errors.append(f"Line {i}: not enough fields (need email:pass:token:clientid)")
+            errors.append(f"Line {i}: not enough fields")
             continue
 
         email = parts[0].strip()
         password = parts[1].strip()
 
+        # Find client_id UUID from the end
         client_id = None
         token_end = len(parts)
         for j in range(len(parts) - 1, 1, -1):
@@ -321,7 +308,6 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
                 client_id = parts[j].strip()
                 token_end = j
                 break
-
         if not client_id:
             client_id = parts[-1].strip()
             token_end = len(parts) - 1
@@ -329,140 +315,126 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
         refresh_token = ":".join(parts[2:token_end]).strip()
 
         if not email or "@" not in email:
-            errors.append(f"Line {i}: invalid email `{email}`")
+            errors.append(f"Line {i}: invalid email")
             continue
         if not refresh_token:
-            errors.append(f"Line {i}: missing refresh_token")
+            errors.append(f"Line {i}: missing token")
             continue
 
-        new_tokens[email.lower()] = {
+        parsed[email.lower()] = {
             "refresh_token": refresh_token,
             "client_id": client_id,
             "password": password,
         }
 
-    # Lock file for atomic read-modify-write
+    # Single locked read-modify-write
     async with file_lock:
-        tokens = load_saved_tokens()
-        exported = load_exported_emails()
+        tokens = _read_tokens()
         added = 0
         skipped = []
-        for email, data in new_tokens.items():
+        for email, data in parsed.items():
             if email in tokens:
-                skipped.append(f"`{email}` (already saved)")
-            elif email in exported:
-                skipped.append(f"`{email}` (previously exported)")
+                skipped.append(f"`{email}` (duplicate)")
             else:
                 tokens[email] = data
                 added += 1
-        _save_json(TOKENS_FILE, tokens)
+        _write_tokens(tokens)
         total_saved = len(tokens)
 
-    desc = f"✅ **{added}** account(s) imported\n📁 **{total_saved}** total saved"
+    desc = f"✅ **{added}** imported\n📁 **{total_saved}** total"
     if skipped:
         desc += f"\n⚠️ **{len(skipped)}** skipped:\n" + "\n".join(skipped[:10])
         if len(skipped) > 10:
-            desc += f"\n...and {len(skipped) - 10} more"
+            desc += f"\n...+{len(skipped) - 10} more"
     if errors:
         desc += f"\n❌ **{len(errors)}** error(s):\n" + "\n".join(errors[:10])
-        if len(errors) > 10:
-            desc += f"\n...and {len(errors) - 10} more"
 
     embed = discord.Embed(title="📤 Upload Results", description=desc, color=0x00FF00 if added else 0xFFAA00)
     embed.set_footer(text="Only you can see this")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # Log to channel
+    # Log
     try:
-        log_channel = bot.get_channel(LOG_CHANNEL_ID)
-        if log_channel:
-            log_embed = discord.Embed(title="📤 Upload Log", color=0x5865F2, timestamp=datetime.utcnow())
-            log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
-            log_embed.add_field(name="Added", value=f"**{added}**", inline=True)
-            log_embed.add_field(name="Skipped", value=f"**{len(skipped)}**", inline=True)
-            log_embed.add_field(name="Errors", value=f"**{len(errors)}**", inline=True)
-            log_embed.add_field(name="Total Saved", value=f"**{total_saved}**", inline=True)
-            await log_channel.send(embed=log_embed)
+        ch = bot.get_channel(LOG_CHANNEL_ID)
+        if ch:
+            e = discord.Embed(title="📤 Upload Log", color=0x5865F2, timestamp=datetime.utcnow())
+            e.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
+            e.add_field(name="Added", value=f"**{added}**", inline=True)
+            e.add_field(name="Skipped", value=f"**{len(skipped)}**", inline=True)
+            e.add_field(name="Total", value=f"**{total_saved}**", inline=True)
+            await ch.send(embed=e)
     except Exception:
         pass
 
 
-# ── /export command (dispense and remove) ─────────────────────────────────────
+# ── /export (dispense + delete, atomic) ───────────────────────────────────────
 
-@bot.tree.command(name="export", description="Export a number of saved tokens as a .txt file")
-@app_commands.describe(amount="Number of accounts to export")
+@bot.tree.command(name="export", description="Dispense accounts as .txt and remove them")
+@app_commands.describe(amount="Number of accounts to dispense")
 async def export_slash(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(ephemeral=True)
 
-    # Lock file for atomic read-modify-write
+    if amount < 1:
+        await interaction.followup.send("❌ Amount must be at least 1.", ephemeral=True)
+        return
+
+    # Single locked read-modify-write
     async with file_lock:
-        tokens = load_saved_tokens()
+        tokens = _read_tokens()
+
         if not tokens:
-            await interaction.followup.send("❌ No saved tokens to export.", ephemeral=True)
+            await interaction.followup.send("❌ No saved tokens.", ephemeral=True)
             return
 
-        if amount < 1:
-            await interaction.followup.send("❌ Amount must be at least 1.", ephemeral=True)
-            return
+        # Take first N
+        keys_to_take = list(tokens.keys())[:amount]
+        taken = {k: tokens.pop(k) for k in keys_to_take}
 
-        items = list(tokens.items())[:amount]
-
-        # Remove exported accounts from saved tokens
-        for email, _ in items:
-            del tokens[email]
-        _save_json(TOKENS_FILE, tokens)
-
-        # Track exported emails so they can never be re-added
-        exported = load_exported_emails()
-        for email, _ in items:
-            exported.add(email)
-        save_exported_emails(exported)
-
+        _write_tokens(tokens)
         remaining = len(tokens)
 
+    # Build file outside lock
     lines = []
-    for email, data in items:
+    for email, data in taken.items():
         pw = data.get("password", "")
         lines.append(f"{email}:{pw}:{data['refresh_token']}:{data['client_id']}")
 
     content = "\n".join(lines)
-    file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_backup.txt")
+    txt_file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_export.txt")
 
-    desc = f"📤 Dispensed **{len(items)}** account(s)\n📁 **{remaining}** remaining"
-    await interaction.followup.send(desc, file=file, ephemeral=True)
+    desc = f"📤 Dispensed **{len(taken)}**\n📁 **{remaining}** remaining"
+    await interaction.followup.send(desc, file=txt_file, ephemeral=True)
 
-    # Log to channel
+    # Log
     try:
-        log_channel = bot.get_channel(LOG_CHANNEL_ID)
-        if log_channel:
-            log_embed = discord.Embed(title="📦 Export Log", color=0xFF9900, timestamp=datetime.utcnow())
-            log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
-            log_embed.add_field(name="Dispensed", value=f"**{len(items)}**", inline=True)
-            log_embed.add_field(name="Remaining", value=f"**{remaining}**", inline=True)
-            await log_channel.send(embed=log_embed)
+        ch = bot.get_channel(LOG_CHANNEL_ID)
+        if ch:
+            e = discord.Embed(title="📦 Export Log", color=0xFF9900, timestamp=datetime.utcnow())
+            e.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
+            e.add_field(name="Dispensed", value=f"**{len(taken)}**", inline=True)
+            e.add_field(name="Remaining", value=f"**{remaining}**", inline=True)
+            await ch.send(embed=e)
     except Exception:
         pass
 
 
-# ── /list command (show saved emails) ──────────────────────────────────────────
+# ── /list ──────────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="list", description="List all saved email accounts")
 async def list_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     async with file_lock:
-        tokens = load_saved_tokens()
+        tokens = _read_tokens()
 
     if not tokens:
         await interaction.followup.send("❌ No saved tokens.", ephemeral=True)
         return
 
     emails = list(tokens.keys())
-    pages = [emails[i:i+20] for i in range(0, len(emails), 20)]
-
     desc = f"📁 **{len(emails)}** saved account(s):\n\n"
-    desc += "\n".join(f"`{e}`" for e in pages[0])
-    if len(pages) > 1:
+    desc += "\n".join(f"`{e}`" for e in emails[:20])
+    if len(emails) > 20:
         desc += f"\n\n...and {len(emails) - 20} more"
 
     embed = discord.Embed(title="📋 Saved Accounts", description=desc, color=0x5865F2)
@@ -470,7 +442,7 @@ async def list_slash(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ── /remove command (admin only) ───────────────────────────────────────────────
+# ── /remove (admin only) ──────────────────────────────────────────────────────
 
 def is_admin(interaction: discord.Interaction) -> bool:
     if interaction.user.guild_permissions.administrator:
@@ -483,21 +455,31 @@ async def remove_slash(interaction: discord.Interaction, email: str):
     await interaction.response.defer(ephemeral=True)
 
     if not is_admin(interaction):
-        await interaction.followup.send("❌ You need the **Admin** role or **Administrator** permission to use this.", ephemeral=True)
+        await interaction.followup.send("❌ You need **Admin** role or **Administrator** permission.", ephemeral=True)
         return
 
     async with file_lock:
-        tokens = load_saved_tokens()
+        tokens = _read_tokens()
         email = email.strip().lower()
-
         if email not in tokens:
-            await interaction.followup.send(f"❌ `{email}` not found in saved tokens.", ephemeral=True)
+            await interaction.followup.send(f"❌ `{email}` not found.", ephemeral=True)
             return
-
         del tokens[email]
-        _save_json(TOKENS_FILE, tokens)
+        _write_tokens(tokens)
+        remaining = len(tokens)
 
-    await interaction.followup.send(f"✅ Removed `{email}`. **{len(tokens)}** accounts remaining.", ephemeral=True)
+    await interaction.followup.send(f"✅ Removed `{email}`. **{remaining}** remaining.", ephemeral=True)
+
+
+# ── /stock (quick count) ──────────────────────────────────────────────────────
+
+@bot.tree.command(name="stock", description="Check how many accounts are saved")
+async def stock_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    async with file_lock:
+        tokens = _read_tokens()
+    embed = discord.Embed(title="📊 Stock", description=f"**{len(tokens)}** accounts available", color=0x5865F2)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ── Bot Ready ──────────────────────────────────────────────────────────────────
@@ -506,9 +488,10 @@ async def remove_slash(interaction: discord.Interaction, email: str):
 async def on_ready():
     print(f"✅ Bot online: {bot.user}")
     print(f"📁 Data dir: {DATA_DIR}")
-    print(f"📁 Tokens file: {TOKENS_FILE}")
-    print(f"📁 Saved accounts: {len(load_saved_tokens())}")
-    print(f"📁 Exported emails: {len(load_exported_emails())}")
+    print(f"📁 Tokens: {TOKENS_FILE}")
+    if os.path.exists(TOKENS_FILE):
+        with open(TOKENS_FILE, "r") as f:
+            print(f"📁 Accounts: {len(json.load(f))}")
     try:
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} commands")
