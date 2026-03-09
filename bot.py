@@ -136,16 +136,12 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
     me = me_resp.json()
     account_email = me.get("mail") or me.get("userPrincipalName") or email or "Unknown"
 
-    # Always update the saved token
-    if latest_refresh and client_id and account_email != "Unknown":
-        tokens = load_saved_tokens()
-        existing = tokens.get(account_email.lower(), {})
-        tokens[account_email.lower()] = {
-            "refresh_token": latest_refresh,
-            "client_id": client_id,
-            "password": existing.get("password", ""),
-        }
-        _save_json(TOKENS_FILE, tokens)
+    # Pass these back so the caller can save under the lock
+    save_info = {
+        "_email": account_email.lower(),
+        "_refresh_token": latest_refresh,
+        "_client_id": client_id,
+    }
 
     params = {
         "$top": 200,
@@ -155,15 +151,15 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
     try:
         resp = requests.get(f"{GRAPH_URL}/me/messages", headers={**headers, "ConsistencyLevel": "eventual"}, params=params, timeout=15)
     except Exception as e:
-        return {"success": False, "error": f"Network error: {e}"}
+        return {"success": False, "error": f"Network error: {e}", **save_info}
 
     if resp.status_code != 200:
-        return {"success": False, "error": f"Graph error {resp.status_code}: {resp.text[:200]}"}
+        return {"success": False, "error": f"Graph error {resp.status_code}: {resp.text[:200]}", **save_info}
 
     messages = resp.json().get("value", [])
 
     if not messages:
-        return {"success": False, "error": "No emails found in inbox", "email": account_email}
+        return {"success": False, "error": "No emails found in inbox", "email": account_email, **save_info}
 
     def parse_date(d):
         try:
@@ -187,6 +183,7 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
                     "from": msg.get("from", {}).get("emailAddress", {}).get("address", ""),
                     "date": msg.get("receivedDateTime", "")[:19].replace("T", " "),
                     "email": account_email,
+                    **save_info,
                 }
 
     for msg in messages:
@@ -207,12 +204,14 @@ def fetch_uber_code(refresh_token: str = None, client_id: str = None, email: str
                 "from": msg.get("from", {}).get("emailAddress", {}).get("address", ""),
                 "date": msg.get("receivedDateTime", "")[:19].replace("T", " "),
                 "email": account_email,
+                **save_info,
             }
 
     return {
         "success": False,
         "error": f"Found Uber emails but no verification code detected",
         "email": account_email,
+        **save_info,
     }
 
 
@@ -244,6 +243,26 @@ async def code_slash(interaction: discord.Interaction, input: str):
     else:
         await interaction.followup.send("❌ Wrong format.\nUse: `email@outlook.com` or `refresh_token:client_id`", ephemeral=True)
         return
+
+    # Save/update token under lock — only touches the ONE email key, doesn't overwrite others
+    save_email = result.get("_email")
+    save_rt = result.get("_refresh_token")
+    save_cid = result.get("_client_id")
+    if save_email and save_rt and save_cid and save_email != "unknown":
+        async with file_lock:
+            tokens = load_saved_tokens()
+            if save_email in tokens:
+                # Update existing — keep password, update refresh token
+                tokens[save_email]["refresh_token"] = save_rt
+                tokens[save_email]["client_id"] = save_cid
+            else:
+                # New entry from token:client_id usage
+                tokens[save_email] = {
+                    "refresh_token": save_rt,
+                    "client_id": save_cid,
+                    "password": "",
+                }
+            _save_json(TOKENS_FILE, tokens)
 
     if result["success"]:
         embed = discord.Embed(title="✅ Uber Code Found", color=0x00FF00)
