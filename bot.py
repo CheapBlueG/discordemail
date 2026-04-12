@@ -113,9 +113,10 @@ def get_token(refresh_token: str, client_id: str):
 
 # ── Fetch Uber Code (pure function — does NOT touch any files) ────────────────
 
-def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None):
-    """Fetches Uber code from inbox. Returns result dict. Never writes files."""
+def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None, keyword: str = "uber"):
+    """Fetches verification code from inbox by keyword. Returns result dict. Never writes files."""
     used_codes = used_codes or set()
+    kw = keyword.lower().strip()
 
     token, error = get_token(refresh_token, client_id)
     if error:
@@ -163,7 +164,7 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None):
     # Priority: verification code subject lines
     for msg in messages:
         subject = msg.get("subject", "").lower()
-        if "your uber verification code" in subject or "verification code" in subject:
+        if f"your {kw} verification code" in subject or "verification code" in subject:
             body = msg.get("body", {})
             body_text = strip_html(body.get("content", "")) if body.get("contentType") == "html" else body.get("content", "")
             code = extract_code(subject + " " + body_text)
@@ -181,7 +182,7 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None):
     for msg in messages:
         subject = msg.get("subject", "").lower()
         from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "").lower()
-        if "uber" not in subject and "uber" not in from_addr:
+        if kw not in subject and kw not in from_addr:
             continue
         body = msg.get("body", {})
         body_text = strip_html(body.get("content", "")) if body.get("contentType") == "html" else body.get("content", "")
@@ -198,7 +199,7 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None):
 
     return {
         "success": False,
-        "error": "No new Uber verification code found (all codes already used)",
+        "error": f"No new {kw} verification code found (all codes already used)",
         "email": account_email,
     }
 
@@ -210,8 +211,11 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None):
 # ── /code ──────────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="code", description="Get Uber code — email or token:client_id")
-@app_commands.describe(input="email@outlook.com   OR   refresh_token:client_id")
-async def code_slash(interaction: discord.Interaction, input: str):
+@app_commands.describe(
+    input="email@outlook.com   OR   refresh_token:client_id",
+    keyword="Sender keyword to search for (default: uber)",
+)
+async def code_slash(interaction: discord.Interaction, input: str, keyword: str = "uber"):
     await interaction.response.defer(ephemeral=True)
 
     # 1) Figure out which refresh_token + client_id to use
@@ -242,7 +246,7 @@ async def code_slash(interaction: discord.Interaction, input: str):
     used_set = set(all_used.get(token_key, []))
 
     # 3) Fetch code (pure function, no file writes)
-    result = fetch_uber_code(refresh_token=rt, client_id=cid, used_codes=used_set)
+    result = fetch_uber_code(refresh_token=rt, client_id=cid, used_codes=used_set, keyword=keyword)
 
     # 4) If we got a code, mark it as used
     if result["success"]:
