@@ -270,6 +270,109 @@ async def code_slash(interaction: discord.Interaction, input: str, keyword: str 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+# ── /read ──────────────────────────────────────────────────────────────────────
+
+def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3):
+    """Fetches the last `count` emails in full. Returns list of email dicts."""
+    token, error = get_token(refresh_token, client_id)
+    if error:
+        return None, error
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    try:
+        me_resp = requests.get(f"{GRAPH_URL}/me?$select=mail,userPrincipalName", headers=headers, timeout=15)
+        me = me_resp.json()
+    except Exception as e:
+        return None, f"Network error: {e}"
+
+    account_email = me.get("mail") or me.get("userPrincipalName") or "Unknown"
+
+    params = {
+        "$top": count,
+        "$orderby": "receivedDateTime desc",
+        "$select": "subject,body,from,receivedDateTime",
+    }
+
+    try:
+        resp = requests.get(f"{GRAPH_URL}/me/messages", headers=headers, params=params, timeout=15)
+    except Exception as e:
+        return None, f"Network error: {e}"
+
+    if resp.status_code != 200:
+        return None, f"Graph error {resp.status_code}: {resp.text[:200]}"
+
+    messages = resp.json().get("value", [])
+    results = []
+    for msg in messages:
+        body = msg.get("body", {})
+        body_text = strip_html(body.get("content", "")) if body.get("contentType") == "html" else body.get("content", "")
+        results.append({
+            "account": account_email,
+            "subject": msg.get("subject", "(no subject)")[:100],
+            "from": msg.get("from", {}).get("emailAddress", {}).get("address", "Unknown"),
+            "date": msg.get("receivedDateTime", "")[:19].replace("T", " "),
+            "body": body_text[:900],  # cap per email so we stay under Discord limits
+        })
+
+    return results, None
+
+
+@bot.tree.command(name="read", description="Read the full body of the last 3 emails")
+@app_commands.describe(input="email@outlook.com   OR   refresh_token:client_id")
+async def read_slash(interaction: discord.Interaction, input: str):
+    await interaction.response.defer(ephemeral=True)
+
+    # Resolve credentials
+    if "@" in input and ":" not in input:
+        email = input.strip().lower()
+        async with file_lock:
+            saved = _read_tokens()
+        if email not in saved:
+            await interaction.followup.send(
+                f"❌ No saved token for `{email}`.\nUse `/upload` to add accounts first.",
+                ephemeral=True,
+            )
+            return
+        rt = saved[email]["refresh_token"]
+        cid = saved[email]["client_id"]
+    elif ":" in input:
+        parts = input.split(":", 1)
+        rt = parts[0].strip()
+        cid = parts[1].strip()
+    else:
+        await interaction.followup.send("❌ Wrong format.\nUse: `email@outlook.com` or `refresh_token:client_id`", ephemeral=True)
+        return
+
+    emails, error = fetch_recent_emails(rt, cid, count=3)
+
+    if error:
+        embed = discord.Embed(title="❌ Failed", description=error, color=0xFF0000)
+        embed.set_footer(text="Only you can see this")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    if not emails:
+        await interaction.followup.send("❌ No emails found in inbox.", ephemeral=True)
+        return
+
+    embeds = []
+    for i, msg in enumerate(emails, 1):
+        embed = discord.Embed(
+            title=f"📧 Email {i} of {len(emails)}",
+            description=f"**Account:** `{msg['account']}`",
+            color=0x5865F2,
+        )
+        embed.add_field(name="From", value=f"`{msg['from']}`", inline=True)
+        embed.add_field(name="Date", value=msg["date"], inline=True)
+        embed.add_field(name="Subject", value=msg["subject"], inline=False)
+        embed.add_field(name="Body", value=msg["body"] or "(empty)", inline=False)
+        embed.set_footer(text="Only you can see this")
+        embeds.append(embed)
+
+    await interaction.followup.send(embeds=embeds, ephemeral=True)
+
+
 # ── /upload ────────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="upload", description="Upload a .txt file with tokens (one per line)")
