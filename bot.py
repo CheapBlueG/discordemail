@@ -22,6 +22,8 @@ DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 TOKENS_FILE = os.path.join(DATA_DIR, "saved_tokens.json")
 USED_CODES_FILE = os.path.join(DATA_DIR, "used_codes.json")
+EMAILS_FILE = os.path.join(DATA_DIR, "saved_emails.json")
+WHITELIST_FILE = os.path.join(DATA_DIR, "mail_whitelist.json")
 
 # Single lock for ALL file operations — no concurrent writes possible
 file_lock = asyncio.Lock()
@@ -56,6 +58,56 @@ def _read_used_codes() -> dict:
 def _write_used_codes(data: dict):
     with open(USED_CODES_FILE, "w") as f:
         json.dump(data, f, indent=4)
+
+def _read_emails() -> list:
+    """Returns list of {email, password, recovery} dicts."""
+    if os.path.exists(EMAILS_FILE):
+        with open(EMAILS_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def _write_emails(data: list):
+    with open(EMAILS_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+def _read_whitelist() -> list:
+    """Returns list of whitelisted user IDs (as strings)."""
+    if os.path.exists(WHITELIST_FILE):
+        with open(WHITELIST_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def _write_whitelist(data: list):
+    with open(WHITELIST_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+def is_mail_authorized(interaction: discord.Interaction) -> bool:
+    """Admins always pass. Whitelisted user IDs also pass."""
+    if interaction.user.guild_permissions.administrator:
+        return True
+    if any(role.name.lower() == "admin" for role in interaction.user.roles):
+        return True
+    whitelist = _read_whitelist()
+    return str(interaction.user.id) in whitelist
+
+def _parse_email_line(line: str) -> dict | None:
+    """Parse any supported combo into a normalized dict. Returns None on failure."""
+    # Normalize delimiter — allow : or ;
+    normalized = line.replace(";", ":")
+    parts = [p.strip() for p in normalized.split(":")]
+    parts = [p for p in parts if p]  # drop empty segments
+
+    if len(parts) < 2:
+        return None
+
+    email = parts[0]
+    if "@" not in email:
+        return None
+
+    password = parts[1]
+    recovery = parts[2] if len(parts) >= 3 else ""
+
+    return {"email": email.lower(), "password": password, "recovery": recovery}
 
 
 # ── Code Extraction ───────────────────────────────────────────────────────────
@@ -587,6 +639,204 @@ async def stock_slash(interaction: discord.Interaction):
         tokens = _read_tokens()
     embed = discord.Embed(title="📊 Stock", description=f"**{len(tokens)}** accounts available", color=0x5865F2)
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EMAIL DISPENSER
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── /addmails ─────────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="addmails", description="Bulk-add emails. Paste combos directly (email:pass:recovery etc.)")
+@app_commands.describe(combos="Paste all combos here, one per line. Supports : or ; delimiters, with or without recovery.")
+async def addmails_slash(interaction: discord.Interaction, combos: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if not is_mail_authorized(interaction):
+        await interaction.followup.send("❌ You are not whitelisted to use this command.", ephemeral=True)
+        return
+
+    lines = [l.strip() for l in combos.splitlines() if l.strip() and not l.strip().startswith("#")]
+    if not lines:
+        await interaction.followup.send("❌ No valid lines found.", ephemeral=True)
+        return
+
+    parsed = []
+    errors = []
+    for i, line in enumerate(lines, 1):
+        entry = _parse_email_line(line)
+        if entry:
+            parsed.append(entry)
+        else:
+            errors.append(f"Line {i}: could not parse `{line[:60]}`")
+
+    async with file_lock:
+        existing = _read_emails()
+        existing_emails = {e["email"] for e in existing}
+        added = 0
+        skipped = []
+        for entry in parsed:
+            if entry["email"] in existing_emails:
+                skipped.append(f"`{entry['email']}` (duplicate)")
+            else:
+                existing.append(entry)
+                existing_emails.add(entry["email"])
+                added += 1
+        _write_emails(existing)
+        total = len(existing)
+
+    desc = f"✅ **{added}** added\n📁 **{total}** total"
+    if skipped:
+        desc += f"\n⚠️ **{len(skipped)}** skipped:\n" + "\n".join(skipped[:10])
+        if len(skipped) > 10:
+            desc += f"\n...+{len(skipped) - 10} more"
+    if errors:
+        desc += f"\n❌ **{len(errors)}** error(s):\n" + "\n".join(errors[:10])
+
+    embed = discord.Embed(title="📥 Mail Import Results", description=desc, color=0x00FF00 if added else 0xFFAA00)
+    embed.set_footer(text="Only you can see this")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    try:
+        ch = bot.get_channel(LOG_CHANNEL_ID)
+        if ch:
+            e = discord.Embed(title="📥 Mail Import Log", color=0x5865F2, timestamp=datetime.utcnow())
+            e.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
+            e.add_field(name="Added", value=f"**{added}**", inline=True)
+            e.add_field(name="Total", value=f"**{total}**", inline=True)
+            await ch.send(embed=e)
+    except Exception:
+        pass
+
+
+# ── /exportmail ───────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="exportmail", description="Dispense email accounts as .txt and remove them")
+@app_commands.describe(amount="Number of accounts to dispense")
+async def exportmail_slash(interaction: discord.Interaction, amount: int):
+    await interaction.response.defer(ephemeral=True)
+
+    if not is_mail_authorized(interaction):
+        await interaction.followup.send("❌ You are not whitelisted to use this command.", ephemeral=True)
+        return
+
+    if amount < 1:
+        await interaction.followup.send("❌ Amount must be at least 1.", ephemeral=True)
+        return
+
+    async with file_lock:
+        emails = _read_emails()
+        if not emails:
+            await interaction.followup.send("❌ No saved email accounts.", ephemeral=True)
+            return
+
+        taken = emails[:amount]
+        remaining_list = emails[amount:]
+        _write_emails(remaining_list)
+        remaining = len(remaining_list)
+
+    # Format output: email:pass:recovery or email:pass if no recovery
+    lines = []
+    for entry in taken:
+        if entry.get("recovery"):
+            lines.append(f"{entry['email']}:{entry['password']}:{entry['recovery']}")
+        else:
+            lines.append(f"{entry['email']}:{entry['password']}")
+
+    content = "\n".join(lines)
+    txt_file = discord.File(io.BytesIO(content.encode("utf-8")), filename="emails_export.txt")
+
+    desc = f"📤 Dispensed **{len(taken)}**\n📁 **{remaining}** remaining"
+    await interaction.followup.send(desc, file=txt_file, ephemeral=True)
+
+    try:
+        ch = bot.get_channel(LOG_CHANNEL_ID)
+        if ch:
+            e = discord.Embed(title="📦 Mail Export Log", color=0xFF9900, timestamp=datetime.utcnow())
+            e.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
+            e.add_field(name="Dispensed", value=f"**{len(taken)}**", inline=True)
+            e.add_field(name="Remaining", value=f"**{remaining}**", inline=True)
+            await ch.send(embed=e)
+    except Exception:
+        pass
+
+
+# ── /stockmail ────────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="stockmail", description="Check how many email accounts are saved")
+async def stockmail_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not is_mail_authorized(interaction):
+        await interaction.followup.send("❌ You are not whitelisted to use this command.", ephemeral=True)
+        return
+    async with file_lock:
+        emails = _read_emails()
+    embed = discord.Embed(title="📊 Mail Stock", description=f"**{len(emails)}** email accounts available", color=0x5865F2)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ── /mailwhitelist (admin only) ───────────────────────────────────────────────
+
+@bot.tree.command(name="mailwhitelist", description="[Admin] Manage whitelist for email dispenser commands")
+@app_commands.describe(
+    action="add / remove / list",
+    user="The user to add or remove (not needed for list)",
+)
+async def mailwhitelist_slash(interaction: discord.Interaction, action: str, user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+
+    if not is_admin(interaction):
+        await interaction.followup.send("❌ You need **Admin** role or **Administrator** permission.", ephemeral=True)
+        return
+
+    action = action.strip().lower()
+
+    if action == "list":
+        async with file_lock:
+            whitelist = _read_whitelist()
+        if not whitelist:
+            await interaction.followup.send("📋 Whitelist is empty.", ephemeral=True)
+            return
+        lines = []
+        for uid in whitelist:
+            member = interaction.guild.get_member(int(uid))
+            lines.append(f"<@{uid}> (`{uid}`)" if member else f"`{uid}` (not in server)")
+        embed = discord.Embed(
+            title="📋 Mail Whitelist",
+            description="\n".join(lines),
+            color=0x5865F2,
+        )
+        embed.set_footer(text=f"{len(whitelist)} user(s)")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    if user is None:
+        await interaction.followup.send("❌ Please specify a user for `add` or `remove`.", ephemeral=True)
+        return
+
+    uid = str(user.id)
+
+    async with file_lock:
+        whitelist = _read_whitelist()
+
+        if action == "add":
+            if uid in whitelist:
+                await interaction.followup.send(f"⚠️ {user.mention} is already whitelisted.", ephemeral=True)
+                return
+            whitelist.append(uid)
+            _write_whitelist(whitelist)
+            await interaction.followup.send(f"✅ Added {user.mention} to the mail whitelist.", ephemeral=True)
+
+        elif action == "remove":
+            if uid not in whitelist:
+                await interaction.followup.send(f"❌ {user.mention} is not in the whitelist.", ephemeral=True)
+                return
+            whitelist.remove(uid)
+            _write_whitelist(whitelist)
+            await interaction.followup.send(f"✅ Removed {user.mention} from the mail whitelist.", ephemeral=True)
+
+        else:
+            await interaction.followup.send("❌ Invalid action. Use `add`, `remove`, or `list`.", ephemeral=True)
 
 
 # ── Bot Ready ──────────────────────────────────────────────────────────────────
