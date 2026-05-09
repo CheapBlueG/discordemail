@@ -158,7 +158,7 @@ def get_token(refresh_token: str, client_id: str):
 
 def parse_credentials(input_str: str, saved_tokens: dict):
     """
-    Looks up the email in the saved tokens. Also acts as a fallback parser 
+    Looks up the email in the saved tokens instantly. Also acts as a fallback parser 
     if a full combo string or raw token is pasted.
     """
     input_str = input_str.strip()
@@ -481,10 +481,12 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
             errors.append(f"Line {i}: missing token")
             continue
 
+        # Instant Association: Link email to RT and CID immediately
         parsed[email.lower()] = {
             "refresh_token": refresh_token,
             "client_id": client_id,
             "password": password,
+            "dispensed": False  # New flag for non-destructive export
         }
 
     async with file_lock:
@@ -525,9 +527,9 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
         pass
 
 
-# ── /export (dispense + delete, atomic) ───────────────────────────────────────
+# ── /export (dispense + mark, non-destructive) ────────────────────────────────
 
-@bot.tree.command(name="export", description="Dispense accounts as .txt and remove them")
+@bot.tree.command(name="export", description="Take an available account (Non-destructive)")
 @app_commands.describe(amount="Number of accounts to dispense")
 async def export_slash(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(ephemeral=True)
@@ -539,25 +541,27 @@ async def export_slash(interaction: discord.Interaction, amount: int):
     async with file_lock:
         tokens = _read_tokens()
 
-        if not tokens:
-            await interaction.followup.send("❌ No saved tokens.", ephemeral=True)
+        # Filter for accounts that have NOT been dispensed yet
+        available = [k for k, v in tokens.items() if not v.get("dispensed", False)]
+
+        if not available:
+            await interaction.followup.send("❌ No available tokens left to take.", ephemeral=True)
             return
 
-        keys_to_take = list(tokens.keys())[:amount]
-        taken = {k: tokens.pop(k) for k in keys_to_take}
+        keys_to_take = available[:amount]
+        lines = []
+        for k in keys_to_take:
+            tokens[k]["dispensed"] = True  # Mark as taken but KEEP associated
+            d = tokens[k]
+            lines.append(f"{k}:{d.get('password', '')}:{d['refresh_token']}:{d['client_id']}")
 
         _write_tokens(tokens)
-        remaining = len(tokens)
-
-    lines = []
-    for email, data in taken.items():
-        pw = data.get("password", "")
-        lines.append(f"{email}:{pw}:{data['refresh_token']}:{data['client_id']}")
+        remaining = sum(1 for v in tokens.values() if not v.get("dispensed", False))
 
     content = "\n".join(lines)
     txt_file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_export.txt")
 
-    desc = f"📤 Dispensed **{len(taken)}**\n📁 **{remaining}** remaining"
+    desc = f"📤 Dispensed **{len(keys_to_take)}**\n📁 **{remaining}** available to take remaining"
     await interaction.followup.send(desc, file=txt_file, ephemeral=True)
 
     try:
@@ -565,7 +569,7 @@ async def export_slash(interaction: discord.Interaction, amount: int):
         if ch:
             e = discord.Embed(title="📦 Export Log", color=0xFF9900, timestamp=datetime.utcnow())
             e.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
-            e.add_field(name="Dispensed", value=f"**{len(taken)}**", inline=True)
+            e.add_field(name="Dispensed", value=f"**{len(keys_to_take)}**", inline=True)
             e.add_field(name="Remaining", value=f"**{remaining}**", inline=True)
             await ch.send(embed=e)
     except Exception:
@@ -574,7 +578,7 @@ async def export_slash(interaction: discord.Interaction, amount: int):
 
 # ── /list ──────────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="list", description="List all saved email accounts")
+@bot.tree.command(name="list", description="List all associated email accounts")
 async def list_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
@@ -586,12 +590,12 @@ async def list_slash(interaction: discord.Interaction):
         return
 
     emails = list(tokens.keys())
-    desc = f"📁 **{len(emails)}** saved account(s):\n\n"
+    desc = f"📁 **{len(emails)}** associated account(s):\n\n"
     desc += "\n".join(f"`{e}`" for e in emails[:20])
     if len(emails) > 20:
         desc += f"\n\n...and {len(emails) - 20} more"
 
-    embed = discord.Embed(title="📋 Saved Accounts", description=desc, color=0x5865F2)
+    embed = discord.Embed(title="📋 Associated Accounts", description=desc, color=0x5865F2)
     embed.set_footer(text="Only you can see this")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -603,7 +607,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
         return True
     return any(role.name.lower() == "admin" for role in interaction.user.roles)
 
-@bot.tree.command(name="remove", description="[Admin] Remove a saved email account")
+@bot.tree.command(name="remove", description="[Admin] Completely remove a saved email account")
 @app_commands.describe(email="Email to remove")
 async def remove_slash(interaction: discord.Interaction, email: str):
     await interaction.response.defer(ephemeral=True)
@@ -632,7 +636,9 @@ async def stock_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with file_lock:
         tokens = _read_tokens()
-    embed = discord.Embed(title="📊 Stock", description=f"**{len(tokens)}** accounts available", color=0x5865F2)
+    avail = sum(1 for v in tokens.values() if not v.get("dispensed", False))
+    total = len(tokens)
+    embed = discord.Embed(title="📊 Stock Status", description=f"**{avail}** available to take\n**{total}** total associated", color=0x5865F2)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
