@@ -88,11 +88,9 @@ def is_mail_authorized(interaction: discord.Interaction) -> bool:
     return str(interaction.user.id) in whitelist
 
 def _parse_email_line(line: str) -> dict | None:
-    """Parse any supported combo into a normalized dict. Returns None on failure."""
-    # Normalize delimiter — allow : or ;
     normalized = line.replace(";", ":")
     parts = [p.strip() for p in normalized.split(":")]
-    parts = [p for p in parts if p]  # drop empty segments
+    parts = [p for p in parts if p] 
 
     if len(parts) < 2:
         return None
@@ -103,7 +101,6 @@ def _parse_email_line(line: str) -> dict | None:
 
     password = parts[1]
     recovery = parts[2] if len(parts) >= 3 else ""
-
     return {"email": email.lower(), "password": password, "recovery": recovery}
 
 
@@ -133,7 +130,7 @@ def strip_html(html: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-# ── Token Acquisition ──────────────────────────────────────────────────────────
+# ── Token Acquisition & Validation ─────────────────────────────────────────────
 
 def get_token(refresh_token: str, client_id: str):
     data = {
@@ -159,11 +156,52 @@ def get_token(refresh_token: str, client_id: str):
     else:
         return None, f"**Auth error:** {err[:300]}"
 
+def parse_credentials(input_str: str, saved_tokens: dict):
+    """
+    Looks up the email in the saved tokens instantly. Also acts as a fallback parser 
+    if a full combo string or raw token is pasted.
+    """
+    input_str = input_str.strip()
+    
+    if ":" not in input_str and "@" in input_str:
+        lookup_email = input_str.lower()
+        if lookup_email not in saved_tokens:
+            return None, None, f"❌ No saved token for `{lookup_email}`.\nUse `/upload` to add accounts first."
+        return saved_tokens[lookup_email]["refresh_token"], saved_tokens[lookup_email]["client_id"], None
+        
+    elif ":" in input_str:
+        parts = input_str.split(":")
+        
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip(), None
+        
+        client_id = None
+        token_end = len(parts)
+        for j in range(len(parts) - 1, 0, -1):
+            if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', parts[j].strip(), re.IGNORECASE):
+                client_id = parts[j].strip()
+                token_end = j
+                break
+        if not client_id:
+            client_id = parts[-1].strip()
+            token_end = len(parts) - 1
+        
+        rt_start = 0
+        if "@" in parts[0]:
+            rt_start = 2 if len(parts) >= 4 else 1
+            
+        rt = ":".join(parts[rt_start:token_end]).strip()
+        if not rt:
+            return None, None, "❌ Could not parse refresh token from combo."
+            
+        return rt, client_id, None
+        
+    return None, None, "❌ Wrong format.\nUse: `email@outlook.com` or paste an account combo string."
+
 
 # ── Fetch Uber Code (pure function — does NOT touch any files) ────────────────
 
 def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None, keyword: str = "uber"):
-    """Fetches verification code from inbox by keyword. Returns result dict. Never writes files."""
     used_codes = used_codes or set()
     kw = keyword.lower().strip()
 
@@ -210,7 +248,6 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None, 
 
     messages.sort(key=lambda x: parse_date(x.get("receivedDateTime", "")), reverse=True)
 
-    # Priority: verification code subject lines
     for msg in messages:
         subject = msg.get("subject", "").lower()
         if f"your {kw} verification code" in subject or "verification code" in subject:
@@ -227,7 +264,6 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None, 
                     "email": account_email,
                 }
 
-    # Fallback: any Uber email
     for msg in messages:
         subject = msg.get("subject", "").lower()
         from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "").lower()
@@ -260,11 +296,14 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None, 
 # ── /password ──────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="password", description="Get the saved password for an associated email")
-@app_commands.describe(input="The exact email address you want to look up")
-async def password_slash(interaction: discord.Interaction, input: str):
+@app_commands.describe(email="The exact email address you want to look up")
+async def password_slash(interaction: discord.Interaction, email: str):
     await interaction.response.defer(ephemeral=True)
 
-    email_key = input.strip().lower()
+    # In case the user pasted a full line combo, extract just the email
+    email_key = email.strip().lower()
+    if ":" in email_key:
+        email_key = email_key.split(":")[0].strip()
 
     async with file_lock:
         tokens = _read_tokens()
@@ -272,15 +311,21 @@ async def password_slash(interaction: discord.Interaction, input: str):
 
     # 1. Check associated tokens database (from /upload)
     if email_key in tokens:
-        pwd = tokens[email_key].get("password", "No password saved.")
-        await interaction.followup.send(f"🔑 Password for `{email_key}`: **{pwd}**", ephemeral=True)
+        pwd = tokens[email_key].get("password")
+        if pwd:
+            await interaction.followup.send(f"🔑 Password for `{email_key}`: **{pwd}**", ephemeral=True)
+        else:
+            await interaction.followup.send(f"⚠️ `{email_key}` is in the system, but the password field was saved as blank.", ephemeral=True)
         return
 
     # 2. Check dispenser database (from /addmails)
     for e in emails_list:
         if e["email"] == email_key:
-            pwd = e.get("password", "No password saved.")
-            await interaction.followup.send(f"🔑 Password for `{email_key}`: **{pwd}**", ephemeral=True)
+            pwd = e.get("password")
+            if pwd:
+                await interaction.followup.send(f"🔑 Password for `{email_key}`: **{pwd}**", ephemeral=True)
+            else:
+                await interaction.followup.send(f"⚠️ `{email_key}` is in the system, but the password field was saved as blank.", ephemeral=True)
             return
 
     await interaction.followup.send(f"❌ No saved data found for `{email_key}`.", ephemeral=True)
@@ -288,54 +333,39 @@ async def password_slash(interaction: discord.Interaction, input: str):
 
 # ── /code ──────────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="code", description="Get Uber code — email or token:client_id")
+@bot.tree.command(name="code", description="Get code using an email address, or refresh_token:client_id")
 @app_commands.describe(
-    input="email@outlook.com   OR   refresh_token:client_id",
+    email="Enter the email address (e.g., test@outlook.com) OR refresh_token:client_id",
     keyword="Sender keyword to search for (default: uber)",
 )
-async def code_slash(interaction: discord.Interaction, input: str, keyword: str = "uber"):
+async def code_slash(interaction: discord.Interaction, email: str, keyword: str = "uber"):
     await interaction.response.defer(ephemeral=True)
 
-    # 1) Figure out which refresh_token + client_id to use
-    if "@" in input and ":" not in input:
-        email = input.strip().lower()
-        async with file_lock:
-            saved = _read_tokens()
-        if email not in saved:
-            await interaction.followup.send(
-                f"❌ No saved token for `{email}`.\nUse `/upload` to add accounts first.",
-                ephemeral=True,
-            )
-            return
-        rt = saved[email]["refresh_token"]
-        cid = saved[email]["client_id"]
-    elif ":" in input:
-        parts = input.split(":", 1)
-        rt = parts[0].strip()
-        cid = parts[1].strip()
-    else:
-        await interaction.followup.send("❌ Wrong format.\nUse: `email@outlook.com` or `refresh_token:client_id`", ephemeral=True)
+    async with file_lock:
+        saved = _read_tokens()
+        
+    rt, cid, err = parse_credentials(email, saved)
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
         return
 
-    # 2) Load used codes for this token (so we skip already-returned codes)
     async with file_lock:
         all_used = _read_used_codes()
-    token_key = rt[:20]  # use first 20 chars of refresh token as key
+    token_key = rt[:20] 
     used_set = set(all_used.get(token_key, []))
 
-    # 3) Fetch code (pure function, no file writes)
     result = fetch_uber_code(refresh_token=rt, client_id=cid, used_codes=used_set, keyword=keyword)
 
-    # 4) If we got a code, mark it as used
     if result["success"]:
+        # Update Used Codes to prevent duplicates
         async with file_lock:
-            all_used = _read_used_codes()  # re-read fresh
+            all_used = _read_used_codes()
             if token_key not in all_used:
                 all_used[token_key] = []
             all_used[token_key].append(result["code"])
             _write_used_codes(all_used)
 
-        embed = discord.Embed(title="✅ Uber Code Found", color=0x00FF00)
+        embed = discord.Embed(title="✅ Code Found", color=0x00FF00)
         embed.add_field(name="Code", value=f"**{result['code']}**", inline=False)
         embed.add_field(name="Email", value=f"`{result['email']}`", inline=True)
         embed.add_field(name="Subject", value=result.get("subject", "N/A"), inline=False)
@@ -351,7 +381,6 @@ async def code_slash(interaction: discord.Interaction, input: str, keyword: str 
 # ── /read ──────────────────────────────────────────────────────────────────────
 
 def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3):
-    """Fetches the last `count` emails in full. Returns list of email dicts."""
     token, error = get_token(refresh_token, client_id)
     if error:
         return None, error
@@ -390,43 +419,29 @@ def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3):
             "subject": msg.get("subject", "(no subject)")[:100],
             "from": msg.get("from", {}).get("emailAddress", {}).get("address", "Unknown"),
             "date": msg.get("receivedDateTime", "")[:19].replace("T", " "),
-            "body": body_text[:900],  # cap per email so we stay under Discord limits
+            "body": body_text[:900], 
         })
 
     return results, None
 
-
-@bot.tree.command(name="read", description="Read the full body of recent emails")
+@bot.tree.command(name="read", description="Read the full body of the last recent emails")
 @app_commands.describe(
-    input="email@outlook.com   OR   refresh_token:client_id",
-    amount="Number of emails to read (1-10, default 3)"
+    email="Enter the email address OR refresh_token:client_id",
+    amount="Number of recent emails to read (1-10, default 3)"
 )
-async def read_slash(interaction: discord.Interaction, input: str, amount: int = 3):
+async def read_slash(interaction: discord.Interaction, email: str, amount: int = 3):
     await interaction.response.defer(ephemeral=True)
 
     # Cap amount to prevent Discord API errors
     if amount < 1: amount = 1
     if amount > 10: amount = 10
 
-    # Resolve credentials
-    if "@" in input and ":" not in input:
-        email = input.strip().lower()
-        async with file_lock:
-            saved = _read_tokens()
-        if email not in saved:
-            await interaction.followup.send(
-                f"❌ No saved token for `{email}`.\nUse `/upload` to add accounts first.",
-                ephemeral=True,
-            )
-            return
-        rt = saved[email]["refresh_token"]
-        cid = saved[email]["client_id"]
-    elif ":" in input:
-        parts = input.split(":", 1)
-        rt = parts[0].strip()
-        cid = parts[1].strip()
-    else:
-        await interaction.followup.send("❌ Wrong format.\nUse: `email@outlook.com` or `refresh_token:client_id`", ephemeral=True)
+    async with file_lock:
+        saved = _read_tokens()
+
+    rt, cid, err = parse_credentials(email, saved)
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
         return
 
     emails, error = fetch_recent_emails(rt, cid, count=amount)
@@ -451,7 +466,13 @@ async def read_slash(interaction: discord.Interaction, input: str, amount: int =
         embed.add_field(name="From", value=f"`{msg['from']}`", inline=True)
         embed.add_field(name="Date", value=msg["date"], inline=True)
         embed.add_field(name="Subject", value=msg["subject"], inline=False)
-        embed.add_field(name="Body", value=msg["body"] or "(empty)", inline=False)
+        
+        # Protect against Discord's 1024 char field limits
+        body_text = msg["body"] or "(empty)"
+        if len(body_text) > 1024:
+            body_text = body_text[:1021] + "..."
+            
+        embed.add_field(name="Body", value=body_text, inline=False)
         embed.set_footer(text="Only you can see this")
         embeds.append(embed)
 
@@ -480,7 +501,6 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
         await interaction.followup.send("❌ File is empty or has no valid lines.", ephemeral=True)
         return
 
-    # Parse all lines first (no file access needed)
     parsed = {}
     errors = []
     for i, line in enumerate(lines, 1):
@@ -492,7 +512,6 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
         email = parts[0].strip()
         password = parts[1].strip()
 
-        # Find client_id UUID from the end
         client_id = None
         token_end = len(parts)
         for j in range(len(parts) - 1, 1, -1):
@@ -517,10 +536,8 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
             "refresh_token": refresh_token,
             "client_id": client_id,
             "password": password,
-            "dispensed": False
         }
 
-    # Single locked read-modify-write
     async with file_lock:
         tokens = _read_tokens()
         added = 0
@@ -546,7 +563,6 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
     embed.set_footer(text="Only you can see this")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # Log
     try:
         ch = bot.get_channel(LOG_CHANNEL_ID)
         if ch:
@@ -562,7 +578,7 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
 
 # ── /export (dispense + delete, atomic) ───────────────────────────────────────
 
-@bot.tree.command(name="export", description="Dispense accounts as .txt (marks as dispensed, keeps tokens)")
+@bot.tree.command(name="export", description="Dispense accounts as .txt and remove them")
 @app_commands.describe(amount="Number of accounts to dispense")
 async def export_slash(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(ephemeral=True)
@@ -571,27 +587,19 @@ async def export_slash(interaction: discord.Interaction, amount: int):
         await interaction.followup.send("❌ Amount must be at least 1.", ephemeral=True)
         return
 
-    # Single locked read-modify-write
     async with file_lock:
         tokens = _read_tokens()
 
-        available_keys = [k for k, v in tokens.items() if not v.get("dispensed", False)]
-
-        if not available_keys:
-            await interaction.followup.send("❌ No available tokens to dispense.", ephemeral=True)
+        if not tokens:
+            await interaction.followup.send("❌ No saved tokens.", ephemeral=True)
             return
 
-        # Take first N
-        keys_to_take = available_keys[:amount]
-        taken = {}
-        for k in keys_to_take:
-            tokens[k]["dispensed"] = True
-            taken[k] = tokens[k]
+        keys_to_take = list(tokens.keys())[:amount]
+        taken = {k: tokens.pop(k) for k in keys_to_take}
 
         _write_tokens(tokens)
-        remaining = sum(1 for v in tokens.values() if not v.get("dispensed", False))
+        remaining = len(tokens)
 
-    # Build file outside lock
     lines = []
     for email, data in taken.items():
         pw = data.get("password", "")
@@ -600,10 +608,9 @@ async def export_slash(interaction: discord.Interaction, amount: int):
     content = "\n".join(lines)
     txt_file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_export.txt")
 
-    desc = f"📤 Dispensed **{len(taken)}**\n📁 **{remaining}** available remaining"
+    desc = f"📤 Dispensed **{len(taken)}**\n📁 **{remaining}** remaining"
     await interaction.followup.send(desc, file=txt_file, ephemeral=True)
 
-    # Log
     try:
         ch = bot.get_channel(LOG_CHANNEL_ID)
         if ch:
@@ -647,7 +654,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
         return True
     return any(role.name.lower() == "admin" for role in interaction.user.roles)
 
-@bot.tree.command(name="remove", description="[Admin] Remove a saved email account")
+@bot.tree.command(name="remove", description="[Admin] Completely remove a saved email account")
 @app_commands.describe(email="Email to remove")
 async def remove_slash(interaction: discord.Interaction, email: str):
     await interaction.response.defer(ephemeral=True)
@@ -671,15 +678,12 @@ async def remove_slash(interaction: discord.Interaction, email: str):
 
 # ── /stock (quick count) ──────────────────────────────────────────────────────
 
-@bot.tree.command(name="stock", description="Check how many accounts are saved and available")
+@bot.tree.command(name="stock", description="Check how many accounts are saved")
 async def stock_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with file_lock:
         tokens = _read_tokens()
-        
-    available = sum(1 for v in tokens.values() if not v.get("dispensed", False))
-    total = len(tokens)
-    embed = discord.Embed(title="📊 Stock", description=f"**{available}** accounts available\n**{total}** total saved", color=0x5865F2)
+    embed = discord.Embed(title="📊 Stock", description=f"**{len(tokens)}** accounts available", color=0x5865F2)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -777,7 +781,6 @@ async def exportmail_slash(interaction: discord.Interaction, amount: int):
         _write_emails(remaining_list)
         remaining = len(remaining_list)
 
-    # Format output: email:pass:recovery or email:pass if no recovery
     lines = []
     for entry in taken:
         if entry.get("recovery"):
