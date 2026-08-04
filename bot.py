@@ -6,6 +6,7 @@ import re
 import os
 import json
 import io
+import html
 import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
@@ -110,7 +111,7 @@ def _parse_email_line(line: str) -> dict | None:
     return {"email": email.lower(), "password": password, "recovery": recovery}
 
 
-# ── Code Extraction ───────────────────────────────────────────────────────────
+# ── Code Extraction & HTML Cleaning ───────────────────────────────────────────
 
 CODE_PATTERNS = [
     r'(\d{6})',
@@ -131,9 +132,20 @@ def extract_code(text: str) -> str | None:
         return match.group(1)
     return None
 
-def strip_html(html: str) -> str:
-    text = re.sub(r'<style[^>]*>.*?</style>|<script[^>]*>.*?</script>|<[^>]+>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
-    return re.sub(r'\s+', ' ', text).strip()
+def strip_html(html_str: str) -> str:
+    """Strips HTML tags, decodes HTML entities (&nbsp;), and removes invisible zero-width padding."""
+    if not html_str:
+        return ""
+    # 1. Unescape HTML entities (&nbsp;, &zwnj;, &#8478;, &amp;, etc.)
+    text = html.unescape(html_str)
+    # 2. Remove style, script, and all HTML tags
+    text = re.sub(r'<style[^>]*>.*?</style>|<script[^>]*>.*?</script>|<[^>]+>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+    # 3. Remove invisible zero-width Unicode padding (\u200b-\u200f, \ufeff, \u00ad, \u2060, etc.)
+    text = re.sub(r'[\u200b-\u200f\ufeff\u00ad\u2060\u180e\u202a-\u202e]', '', text)
+    # 4. Replace non-breaking spaces and regular whitespace clutter with a single space
+    text = text.replace('\xa0', ' ')
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
 
 # ── Token Acquisition & Validation ─────────────────────────────────────────────
@@ -215,7 +227,10 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None, 
     if error:
         return {"success": False, "error": error}
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": "outlook.body-content-type=text"
+    }
 
     try:
         me_resp = requests.get(f"{GRAPH_URL}/me?$select=mail,userPrincipalName", headers=headers, timeout=15)
@@ -258,7 +273,7 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None, 
         subject = msg.get("subject", "").lower()
         if f"your {kw} verification code" in subject or "verification code" in subject:
             body = msg.get("body", {})
-            body_text = strip_html(body.get("content", "")) if body.get("contentType") == "html" else body.get("content", "")
+            body_text = strip_html(body.get("content", ""))
             code = extract_code(subject + " " + body_text)
             if code and code not in used_codes:
                 return {
@@ -276,7 +291,7 @@ def fetch_uber_code(refresh_token: str, client_id: str, used_codes: set = None, 
         if kw not in subject and kw not in from_addr:
             continue
         body = msg.get("body", {})
-        body_text = strip_html(body.get("content", "")) if body.get("contentType") == "html" else body.get("content", "")
+        body_text = strip_html(body.get("content", ""))
         code = extract_code(subject + " " + body_text)
         if code and code not in used_codes:
             return {
@@ -391,7 +406,11 @@ def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3, orde
     if error:
         return None, error
 
-    headers = {"Authorization": f"Bearer {token}"}
+    # "Prefer: outlook.body-content-type=text" tells Microsoft Graph to convert HTML layouts to readable text
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": "outlook.body-content-type=text"
+    }
 
     try:
         me_resp = requests.get(f"{GRAPH_URL}/me?$select=mail,userPrincipalName", headers=headers, timeout=15)
@@ -421,7 +440,8 @@ def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3, orde
     results = []
     for msg in messages:
         body = msg.get("body", {})
-        body_text = strip_html(body.get("content", "")) if body.get("contentType") == "html" else body.get("content", "")
+        # Always run through strip_html to clean entities (&nbsp;) and invisible zero-width Unicode padding
+        body_text = strip_html(body.get("content", ""))
         results.append({
             "account": account_email,
             "subject": msg.get("subject", "(no subject)")[:100],
@@ -432,10 +452,10 @@ def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3, orde
 
     return results, None
 
-@bot.tree.command(name="read", description="Read the full body of emails")
+@bot.tree.command(name="read", description="Read the readable text body of emails")
 @app_commands.describe(
     email_or_token="Enter the email address OR refresh_token:client_id",
-    amount="Number of emails to read (1-10, default 3)",
+    amount="Number of recent emails to read (1-10, default 3)",
     order="Fetch 'latest' (newest) or 'earliest' (oldest) emails"
 )
 async def read_slash(interaction: discord.Interaction, email_or_token: str, amount: int = 3, order: Literal["latest", "earliest"] = "latest"):
@@ -467,7 +487,7 @@ async def read_slash(interaction: discord.Interaction, email_or_token: str, amou
     embeds = []
     for i, msg in enumerate(emails, 1):
         embed = discord.Embed(
-            title=f"📧 Email {i} of {len(emails)}",
+            title=f"📧 Email {i} of {len(emails)} ({order.capitalize()})",
             description=f"**Account:** `{msg['account']}`",
             color=0x5865F2,
         )
@@ -475,7 +495,7 @@ async def read_slash(interaction: discord.Interaction, email_or_token: str, amou
         embed.add_field(name="Date", value=msg["date"], inline=True)
         embed.add_field(name="Subject", value=msg["subject"], inline=False)
         
-        # Prevent Discord API errors by truncating over-length bodies
+        # Protect against Discord's 1024 char field limit while displaying clean readable text
         body_text = msg["body"] or "(empty)"
         if len(body_text) > 1024:
             body_text = body_text[:1021] + "..."
