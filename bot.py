@@ -9,6 +9,7 @@ import io
 import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
+from typing import Literal
 
 load_dotenv()
 
@@ -86,6 +87,11 @@ def is_mail_authorized(interaction: discord.Interaction) -> bool:
         return True
     whitelist = _read_whitelist()
     return str(interaction.user.id) in whitelist
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    return any(role.name.lower() == "admin" for role in interaction.user.roles)
 
 def _parse_email_line(line: str) -> dict | None:
     normalized = line.replace(";", ":")
@@ -335,16 +341,16 @@ async def password_slash(interaction: discord.Interaction, email: str):
 
 @bot.tree.command(name="code", description="Get code using an email address, or refresh_token:client_id")
 @app_commands.describe(
-    email="Enter the email address (e.g., test@outlook.com) OR refresh_token:client_id",
+    email_or_token="Enter the email address (e.g., test@outlook.com) OR refresh_token:client_id",
     keyword="Sender keyword to search for (default: uber)",
 )
-async def code_slash(interaction: discord.Interaction, email: str, keyword: str = "uber"):
+async def code_slash(interaction: discord.Interaction, email_or_token: str, keyword: str = "uber"):
     await interaction.response.defer(ephemeral=True)
 
     async with file_lock:
         saved = _read_tokens()
         
-    rt, cid, err = parse_credentials(email, saved)
+    rt, cid, err = parse_credentials(email_or_token, saved)
     if err:
         await interaction.followup.send(err, ephemeral=True)
         return
@@ -380,7 +386,7 @@ async def code_slash(interaction: discord.Interaction, email: str, keyword: str 
 
 # ── /read ──────────────────────────────────────────────────────────────────────
 
-def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3):
+def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3, order: str = "latest"):
     token, error = get_token(refresh_token, client_id)
     if error:
         return None, error
@@ -395,9 +401,11 @@ def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3):
 
     account_email = me.get("mail") or me.get("userPrincipalName") or "Unknown"
 
+    orderby_direction = "desc" if order == "latest" else "asc"
+
     params = {
         "$top": count,
-        "$orderby": "receivedDateTime desc",
+        "$orderby": f"receivedDateTime {orderby_direction}",
         "$select": "subject,body,from,receivedDateTime",
     }
 
@@ -424,12 +432,13 @@ def fetch_recent_emails(refresh_token: str, client_id: str, count: int = 3):
 
     return results, None
 
-@bot.tree.command(name="read", description="Read the full body of recent emails")
+@bot.tree.command(name="read", description="Read the full body of emails")
 @app_commands.describe(
-    email="Enter the email address OR refresh_token:client_id",
-    amount="Number of recent emails to read (1-10, default 3)"
+    email_or_token="Enter the email address OR refresh_token:client_id",
+    amount="Number of emails to read (1-10, default 3)",
+    order="Fetch 'latest' (newest) or 'earliest' (oldest) emails"
 )
-async def read_slash(interaction: discord.Interaction, email: str, amount: int = 3):
+async def read_slash(interaction: discord.Interaction, email_or_token: str, amount: int = 3, order: Literal["latest", "earliest"] = "latest"):
     await interaction.response.defer(ephemeral=True)
 
     if amount < 1: amount = 1
@@ -438,12 +447,12 @@ async def read_slash(interaction: discord.Interaction, email: str, amount: int =
     async with file_lock:
         saved = _read_tokens()
 
-    rt, cid, err = parse_credentials(email, saved)
+    rt, cid, err = parse_credentials(email_or_token, saved)
     if err:
         await interaction.followup.send(err, ephemeral=True)
         return
 
-    emails, error = fetch_recent_emails(rt, cid, count=amount)
+    emails, error = fetch_recent_emails(rt, cid, count=amount, order=order)
 
     if error:
         embed = discord.Embed(title="❌ Failed", description=error, color=0xFF0000)
@@ -531,10 +540,12 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
             errors.append(f"Line {i}: missing token")
             continue
 
+        # Instant Association: Link email to RT and CID immediately
         parsed[email.lower()] = {
             "refresh_token": refresh_token,
             "client_id": client_id,
             "password": password,
+            "dispensed": False  # New flag for non-destructive export
         }
 
     async with file_lock:
@@ -577,7 +588,7 @@ async def upload_slash(interaction: discord.Interaction, file: discord.Attachmen
 
 # ── /export (dispense + mark, non-destructive) ────────────────────────────────
 
-@bot.tree.command(name="export", description="Dispense accounts as .txt and remove them from available pool")
+@bot.tree.command(name="export", description="Take an available account (Non-destructive)")
 @app_commands.describe(amount="Number of accounts to dispense")
 async def export_slash(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(ephemeral=True)
@@ -589,31 +600,30 @@ async def export_slash(interaction: discord.Interaction, amount: int):
     async with file_lock:
         tokens = _read_tokens()
 
-        # Find accounts that haven't been exported yet
-        available_keys = [k for k, v in tokens.items() if not v.get("exported", False)]
+        # Filter for accounts that have NOT been dispensed yet
+        available = [k for k, v in tokens.items() if not v.get("dispensed", False)]
 
-        if not available_keys:
-            await interaction.followup.send("❌ No saved tokens available to dispense.", ephemeral=True)
+        if not available:
+            await interaction.followup.send("❌ No available tokens left to take.", ephemeral=True)
             return
 
-        keys_to_take = available_keys[:amount]
-        taken = {}
+        keys_to_take = available[:amount]
+        lines = []
         for k in keys_to_take:
-            tokens[k]["exported"] = True  # Mark as exported so it isn't dispensed twice
-            taken[k] = tokens[k]
+            tokens[k]["dispensed"] = True  # Mark as taken but KEEP associated
+            d = tokens[k]
+            pwd = d.get('password')
+            if not pwd:
+                pwd = ""
+            lines.append(f"{k}:{pwd}:{d['refresh_token']}:{d['client_id']}")
 
         _write_tokens(tokens)
-        remaining = len(available_keys) - len(keys_to_take)
-
-    lines = []
-    for email, data in taken.items():
-        pw = data.get("password", "")
-        lines.append(f"{email}:{pw}:{data['refresh_token']}:{data['client_id']}")
+        remaining = sum(1 for v in tokens.values() if not v.get("dispensed", False))
 
     content = "\n".join(lines)
     txt_file = discord.File(io.BytesIO(content.encode("utf-8")), filename="tokens_export.txt")
 
-    desc = f"📤 Dispensed **{len(taken)}**\n📁 **{remaining}** available remaining"
+    desc = f"📤 Dispensed **{len(keys_to_take)}**\n📁 **{remaining}** available to take remaining"
     await interaction.followup.send(desc, file=txt_file, ephemeral=True)
 
     try:
@@ -621,7 +631,7 @@ async def export_slash(interaction: discord.Interaction, amount: int):
         if ch:
             e = discord.Embed(title="📦 Export Log", color=0xFF9900, timestamp=datetime.utcnow())
             e.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
-            e.add_field(name="Dispensed", value=f"**{len(taken)}**", inline=True)
+            e.add_field(name="Dispensed", value=f"**{len(keys_to_take)}**", inline=True)
             e.add_field(name="Remaining", value=f"**{remaining}**", inline=True)
             await ch.send(embed=e)
     except Exception:
@@ -654,11 +664,6 @@ async def list_slash(interaction: discord.Interaction):
 
 # ── /remove (admin only) ──────────────────────────────────────────────────────
 
-def is_admin(interaction: discord.Interaction) -> bool:
-    if interaction.user.guild_permissions.administrator:
-        return True
-    return any(role.name.lower() == "admin" for role in interaction.user.roles)
-
 @bot.tree.command(name="remove", description="[Admin] Remove a saved email account")
 @app_commands.describe(email="Email to remove")
 async def remove_slash(interaction: discord.Interaction, email: str):
@@ -688,10 +693,9 @@ async def stock_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with file_lock:
         tokens = _read_tokens()
-        
-    available = sum(1 for v in tokens.values() if not v.get("exported", False))
+    avail = sum(1 for v in tokens.values() if not v.get("dispensed", False))
     total = len(tokens)
-    embed = discord.Embed(title="📊 Stock", description=f"**{available}** accounts available\n**{total}** total saved in database", color=0x5865F2)
+    embed = discord.Embed(title="📊 Stock Status", description=f"**{avail}** available to take\n**{total}** total associated", color=0x5865F2)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -765,7 +769,7 @@ async def addmails_slash(interaction: discord.Interaction, combos: str):
 
 # ── /exportmail ───────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="exportmail", description="Dispense email accounts as .txt and remove them from available pool")
+@bot.tree.command(name="exportmail", description="Dispense email accounts as .txt and remove them")
 @app_commands.describe(amount="Number of accounts to dispense")
 async def exportmail_slash(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(ephemeral=True)
@@ -780,19 +784,14 @@ async def exportmail_slash(interaction: discord.Interaction, amount: int):
 
     async with file_lock:
         emails = _read_emails()
-        
-        available = [e for e in emails if not e.get("exported", False)]
-
-        if not available:
-            await interaction.followup.send("❌ No saved email accounts available.", ephemeral=True)
+        if not emails:
+            await interaction.followup.send("❌ No saved email accounts.", ephemeral=True)
             return
 
-        taken = available[:amount]
-        for e in taken:
-            e["exported"] = True
-            
-        _write_emails(emails)
-        remaining = len(available) - len(taken)
+        taken = emails[:amount]
+        remaining_list = emails[amount:]
+        _write_emails(remaining_list)
+        remaining = len(remaining_list)
 
     lines = []
     for entry in taken:
@@ -804,7 +803,7 @@ async def exportmail_slash(interaction: discord.Interaction, amount: int):
     content = "\n".join(lines)
     txt_file = discord.File(io.BytesIO(content.encode("utf-8")), filename="emails_export.txt")
 
-    desc = f"📤 Dispensed **{len(taken)}**\n📁 **{remaining}** remaining available"
+    desc = f"📤 Dispensed **{len(taken)}**\n📁 **{remaining}** remaining"
     await interaction.followup.send(desc, file=txt_file, ephemeral=True)
 
     try:
@@ -829,10 +828,7 @@ async def stockmail_slash(interaction: discord.Interaction):
         return
     async with file_lock:
         emails = _read_emails()
-        
-    available = sum(1 for e in emails if not e.get("exported", False))
-    total = len(emails)
-    embed = discord.Embed(title="📊 Mail Stock", description=f"**{available}** email accounts available\n**{total}** total saved in database", color=0x5865F2)
+    embed = discord.Embed(title="📊 Mail Stock", description=f"**{len(emails)}** email accounts available", color=0x5865F2)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
